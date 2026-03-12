@@ -1,0 +1,48 @@
+# =============================================================================
+# Traffic Orchestrator – Simple (legacy) config format
+# =============================================================================
+# Rule syntax:
+#   PROTOCOL  TARGET  PORT  INTERVAL  COUNT  [# description]
+#
+#   PROTOCOL  TCP or UDP
+#   TARGET    A name from the target map below, or a bare IP address
+#   PORT      1 – 65535
+#   INTERVAL  Seconds to wait between connections (0 = fire immediately)
+#   COUNT     Number of connections, or "loop" to repeat indefinitely
+#
+# Global settings
+# =============================================================================
+
+[MASTER]
+PORT = 9000
+PSK  = ChangeMe-Strong-Key1
+
+# ─── Target definitions (name → IP) ──────────────────────────────────────────
+# Define symbolic names for all destination hosts here.
+# Names must be alphanumeric (underscores allowed).
+
+FILESERVER  = 192.168.1.100
+WEBSERVER   = 192.168.1.102
+DNS_SERVER  = 192.168.1.105
+GATEWAY     = 192.168.1.110
+MAILSERVER  = 192.168.1.115
+
+# ─── Traffic rules ───────────────────────────────────────────────────────────
+
+# File server
+TCP   FILESERVER   445   5    loop   # SMB file sharing
+TCP   FILESERVER   139   10   loop   # NetBIOS session service
+
+# Web server
+TCP   WEBSERVER    80    3    loop   # HTTP
+TCP   WEBSERVER    443   4    loop   # HTTPS
+
+# DNS
+UDP   DNS_SERVER   53    2    loop   # DNS queries
+
+# Gateway / proxy
+TCP   GATEWAY      8080  15   loop   # HTTP alternate port
+
+# Mail server
+TCP   MAILSERVER   25    60   loop   # SMTP outbound
+TCP   MAILSERVER   143   60   loop   # IMAP inbox polling

@@ -1,0 +1,38 @@
+# =============================================================================
+# Traffic Orchestrator – Extended (SOURCE → DEST) config format
+# =============================================================================
+# Rule syntax:
+#   PROTOCOL  SOURCE  DEST  PORT  COUNT  [# description]
+#
+#   PROTOCOL  TCP or UDP
+#   SOURCE    Agent host that generates the traffic (name or IP)
+#   DEST      Host that receives the traffic – its port must be open/listening
+#   PORT      1 – 65535
+#   COUNT     Number of connections, or "loop" to repeat indefinitely
+#
+# The master only forwards a rule to the agent whose SOURCE matches its
+# registered host, keeping traffic generation accurate and efficient.
+#
+# Global settings
+# =============================================================================
+
+[MASTER]
+PORT = 9000
+PSK  = ChangeMe-Strong-Key1
+
+# ─── Target definitions (name → IP) ──────────────────────────────────────────
+
+CLIENT      = 10.0.1.10    # Workstation – generates all outbound traffic
+LINUX_SRV   = 10.0.2.10    # Linux backend server
+WIN_SRV     = 10.0.2.20    # Windows backend server
+JUMPHOST    = 10.0.3.5     # SSH jump host / bastion
+
+# ─── Traffic rules ───────────────────────────────────────────────────────────
+# PROTOCOL  SOURCE    DEST        PORT  COUNT
+
+TCP   CLIENT   LINUX_SRV   80    loop   # HTTP to Linux backend
+TCP   CLIENT   LINUX_SRV   443   loop   # HTTPS to Linux backend
+TCP   CLIENT   WIN_SRV     445   loop   # SMB to Windows share
+TCP   CLIENT   WIN_SRV     3389  loop   # RDP to Windows desktop
+UDP   CLIENT   WIN_SRV     53    loop   # DNS queries to Windows DNS
+TCP   CLIENT   JUMPHOST    22    loop   # SSH to bastion host

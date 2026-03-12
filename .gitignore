@@ -1,0 +1,48 @@
+# ─── Compiled binaries ────────────────────────────────────────────────────────
+trafficorch
+trafficorch-*
+*.exe
+bin/
+
+# ─── Test artefacts ───────────────────────────────────────────────────────────
+*.test
+*.out
+coverage.out
+coverage.html
+
+# ─── Log files ────────────────────────────────────────────────────────────────
+*.log
+*.log.*
+
+# ─── Secrets & credentials  ───────────────────────────────────────────────────
+# NEVER commit private keys, .env files, or instance metadata!
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+vm-instance-data.txt
+
+# ─── Site-specific config files (use configs/*.conf.example as templates) ─────
+config_mcl_*.conf
+*.conf
+# Allow the shipped examples to stay tracked:
+!configs/*.conf.example
+
+# ─── Editor / IDE ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ─── Claude Code local settings ───────────────────────────────────────────────
+.claude/
+
+# ─── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ─── Go module cache & vendor ─────────────────────────────────────────────────
+vendor/
