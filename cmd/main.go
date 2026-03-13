@@ -2,6 +2,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -307,8 +308,19 @@ func startStandalone(mCfg masterConnInfo, agentID string) {
 func startStandaloneWithLogger(mCfg masterConnInfo, agentID string, logger *logging.Logger) {
 	agent, err := newStandaloneAgent(config.InstructionsConfFile, mCfg, agentID, logger)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Standalone start failed: %v\n", err)
-		logger.Error(fmt.Sprintf("Standalone start failed: %v", err))
+		if errors.Is(err, os.ErrNotExist) {
+			msg := fmt.Sprintf(
+				"Cannot connect to master and no %s found.\n"+
+					"On first run the master must be reachable so the agent can receive its\n"+
+					"initial traffic rules. Start the master, then retry.\n",
+				config.InstructionsConfFile,
+			)
+			fmt.Fprint(os.Stderr, msg)
+			logger.Error("Standalone start failed: " + config.InstructionsConfFile + " not found and master unreachable")
+		} else {
+			fmt.Fprintf(os.Stderr, "Standalone start failed: %v\n", err)
+			logger.Error(fmt.Sprintf("Standalone start failed: %v", err))
+		}
 		os.Exit(1)
 	}
 
