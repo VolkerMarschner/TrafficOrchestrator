@@ -1,9 +1,9 @@
 # Traffic Orchestrator — Technical Architecture
 
-**Version:** 0.1 (Draft)  
-**Author:** Claudia (Lead Architect)  
-**Date:** 2026-03-10  
-**Status:** 🚧 Initial Concept — Pending Review
+**Version:** 0.2
+**Author:** Claudia (Lead Architect)
+**Date:** 2026-03-13
+**Status:** ✅ Updated — v0.2.0 agent.conf feature incorporated
 
 ---
 
@@ -451,13 +451,29 @@ go func() {
 ### 7.1 Startup Sequence
 
 ```
-1. Parse CLI args (--master, --port, --psk)
-2. Establish TLS connection to Master
-3. Send HELLO message (register)
-4. Wait for commands from Master
-5. Execute commands (LISTEN, CONNECT, STOP)
-6. Report results back to Master
+1. Determine configuration source:
+   a. CLI flags given (--agent --master … --port … --psk …)
+      → parse flags → save to agent.conf → proceed
+   b. No flags / --agent with no flags
+      → look for agent.conf in working directory
+      → found:     load and proceed
+      → not found: print help, exit 0
+2. Validate PSK strength (SEC-5)
+3. Establish TCP connection to Master (HMAC-SHA256 authenticated channel)
+4. Send REGISTER message
+5. Wait for REGISTER_ACK from Master
+6. Enter message loop:
+   - Receive CONFIG_UPDATE → apply new traffic rules
+   - Receive TRAFFIC_START → begin generating traffic
+   - Receive TRAFFIC_STOP  → halt traffic goroutines
+7. Send HEARTBEAT every 30 s
+8. On SIGINT/SIGTERM → graceful shutdown
 ```
+
+**agent.conf** (introduced in v0.2.0) is a simple KEY=VALUE file written
+atomically (temp file + rename) to the working directory whenever an agent
+is started with explicit CLI flags.  All four keys are supported:
+`MASTER`, `PORT`, `PSK`, `ID`.
 
 ### 7.2 Command Execution
 
