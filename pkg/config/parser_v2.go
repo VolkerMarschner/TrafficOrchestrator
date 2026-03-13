@@ -8,9 +8,16 @@ import (
 	"strings"
 )
 
-// ParseExtendedConfigV2 parses a config file with SOURCE->DEST format support.
-// PSK must be set either in the config file (PSK=...) or via the
-// TRAFFICORCH_PSK environment variable. The function fails if no PSK is found.
+// ParseExtendedConfigV2 parses a config file supporting both simple and
+// SOURCE→DEST extended formats.
+//
+// New in v0.3.0:
+//   - TTL=<seconds> in the [MASTER] section tells agents how long to honour
+//     cached instructions without a master connection (0 = never expires).
+//   - Traffic rule lines now capture the SOURCE field (parts[1]) so the master
+//     can route "connect" rules to source agents and "listen" rules to dest agents.
+//
+// PSK must be set in the config file (PSK=...) or via TRAFFICORCH_PSK env var.
 func ParseExtendedConfigV2(filePath string) (*MasterConfig, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -63,13 +70,23 @@ func ParseExtendedConfigV2(filePath string) (*MasterConfig, error) {
 					return nil, fmt.Errorf("line %d: invalid PORT value %q", lineNum, value)
 				}
 				config.Port = port
+
 			case "PSK":
 				config.PSK = value
+
+			case "TTL":
+				ttl, err := strconv.Atoi(value)
+				if err != nil || ttl < 0 {
+					return nil, fmt.Errorf("line %d: invalid TTL value %q (must be >= 0 seconds)", lineNum, value)
+				}
+				config.TTL = ttl
+
 			case "CONFIG":
-				// CONFIG is handled by CLI, skip here
+				// Handled by CLI layer; ignore here.
 				continue
+
 			default:
-				// Assume it's a target definition (e.g. TARGET1=10.0.0.1)
+				// Assume it's a target definition (e.g. FILESERVER=10.0.0.1)
 				targetName := strings.TrimSpace(line[:idx])
 				if len(targetName) > 0 && allAlphaNumeric(targetName) {
 					config.TargetMap[targetName] = value
@@ -79,7 +96,16 @@ func ParseExtendedConfigV2(filePath string) (*MasterConfig, error) {
 			continue
 		}
 
-		// Try to parse as traffic rule: PROTOCOL SOURCE DEST PORT COUNT [NAME]
+		// ── Traffic rule line ────────────────────────────────────────────────
+		// Supported formats:
+		//   Simple:   PROTOCOL  TARGET              PORT  INTERVAL  COUNT [#name]
+		//   Extended: PROTOCOL  SOURCE   DEST        PORT  COUNT    [#name]
+		//
+		// Distinguish by field count: simple has 5+ fields with an INTERVAL column;
+		// extended has 5+ fields but the 4th field is a port (no interval).
+		// We detect the format heuristically: if parts[3] looks like a port number
+		// and parts[4] is count/loop, it's extended; otherwise simple.
+
 		parts := strings.Fields(line)
 		if len(parts) < 5 {
 			return nil, fmt.Errorf("line %d: invalid format (need at least 5 fields), got %q", lineNum, line)
@@ -90,27 +116,89 @@ func ParseExtendedConfigV2(filePath string) (*MasterConfig, error) {
 			return nil, fmt.Errorf("line %d: invalid protocol %q (must be TCP or UDP)", lineNum, parts[0])
 		}
 
-		destName := parts[2]
-
-		port, err := strconv.Atoi(parts[3])
-		if err != nil || port <= 0 || port > maxPort {
-			return nil, fmt.Errorf("line %d: invalid PORT %q (must be 1-65535)", lineNum, parts[3])
-		}
-
-		count := countLoop // Default: loop forever
-		if strings.ToLower(parts[4]) != "loop" {
-			c, err := strconv.Atoi(parts[4])
-			if err != nil || c <= 0 {
-				return nil, fmt.Errorf("line %d: invalid COUNT %q (must be positive number or 'loop')", lineNum, parts[4])
+		// Determine whether this is simple (4-column) or extended (SOURCE DEST) format.
+		// Heuristic: if parts[3] is a valid port AND parts[4] is count/"loop", it's extended.
+		isExtended := false
+		if len(parts) >= 5 {
+			if p, err := strconv.Atoi(parts[3]); err == nil && p > 0 && p <= maxPort {
+				if strings.ToLower(parts[4]) == "loop" {
+					isExtended = true
+				} else if _, err := strconv.Atoi(parts[4]); err == nil {
+					isExtended = true
+				}
 			}
-			count = c
 		}
 
-		rule := &TrafficRule{
-			Protocol: protocol,
-			Target:   destName,
-			Port:     port,
-			Count:    count,
+		var rule *TrafficRule
+
+		if isExtended {
+			// Extended: PROTOCOL SOURCE DEST PORT COUNT [#name]
+			sourceName := parts[1]
+			destName := parts[2]
+
+			port, err := strconv.Atoi(parts[3])
+			if err != nil || port <= 0 || port > maxPort {
+				return nil, fmt.Errorf("line %d: invalid PORT %q", lineNum, parts[3])
+			}
+
+			count := countLoop
+			if strings.ToLower(parts[4]) != "loop" {
+				c, err := strconv.Atoi(parts[4])
+				if err != nil || c <= 0 {
+					return nil, fmt.Errorf("line %d: invalid COUNT %q", lineNum, parts[4])
+				}
+				count = c
+			}
+
+			rule = &TrafficRule{
+				Protocol: protocol,
+				Source:   sourceName, // resolved to IP later (second pass)
+				Target:   destName,   // resolved to IP later
+				Port:     port,
+				Count:    count,
+			}
+		} else {
+			// Simple: PROTOCOL TARGET PORT INTERVAL COUNT [#name]
+			if len(parts) < 5 {
+				return nil, fmt.Errorf("line %d: simple format requires 5 fields", lineNum)
+			}
+
+			targetName := parts[1]
+
+			port, err := strconv.Atoi(parts[2])
+			if err != nil || port <= 0 || port > maxPort {
+				return nil, fmt.Errorf("line %d: invalid PORT %q", lineNum, parts[2])
+			}
+
+			interval, err := strconv.Atoi(parts[3])
+			if err != nil || interval < 0 {
+				return nil, fmt.Errorf("line %d: invalid INTERVAL %q (must be >= 0)", lineNum, parts[3])
+			}
+
+			count := countLoop
+			if strings.ToLower(parts[4]) != "loop" {
+				c, err := strconv.Atoi(parts[4])
+				if err != nil || c <= 0 {
+					return nil, fmt.Errorf("line %d: invalid COUNT %q", lineNum, parts[4])
+				}
+				count = c
+			}
+
+			rule = &TrafficRule{
+				Protocol: protocol,
+				Target:   targetName, // resolved to IP later
+				Port:     port,
+				Interval: interval,
+				Count:    count,
+			}
+		}
+
+		// Optional name from trailing inline comment  (# SMB)
+		if idx := strings.Index(line, "#"); idx != -1 {
+			name := strings.TrimSpace(line[idx+1:])
+			if name != "" {
+				rule.Name = name
+			}
 		}
 
 		config.TrafficRules = append(config.TrafficRules, rule)
@@ -120,15 +208,19 @@ func ParseExtendedConfigV2(filePath string) (*MasterConfig, error) {
 		return nil, fmt.Errorf("error reading config file: %w", err)
 	}
 
-	// Second pass: resolve target names to IPs
-	// (definitions may appear after rule lines in the file)
+	// Second pass: resolve target / source names to IPs.
 	for _, rule := range config.TrafficRules {
 		if resolved, ok := config.TargetMap[rule.Target]; ok {
 			rule.Target = resolved
 		}
+		if rule.Source != "" {
+			if resolved, ok := config.TargetMap[rule.Source]; ok {
+				rule.Source = resolved
+			}
+		}
 	}
 
-	// SEC-1: Fail loudly if PSK is still missing after file + env var
+	// SEC-1: Fail loudly if PSK is still missing after file + env var.
 	if config.PSK == "" {
 		return nil, fmt.Errorf(
 			"PSK is not set: add 'PSK=<key>' to %s or set TRAFFICORCH_PSK environment variable",

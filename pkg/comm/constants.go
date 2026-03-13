@@ -12,7 +12,8 @@ const (
 	MasterConnectTimeout = 10 * time.Second
 
 	// ChannelIdleTimeout is the maximum time without a message before a channel is considered dead.
-	ChannelIdleTimeout = 30 * time.Second
+	// Must be significantly larger than the agent heartbeat interval (30 s).
+	ChannelIdleTimeout = 3 * time.Minute
 )
 
 // Protocol version used in all messages.

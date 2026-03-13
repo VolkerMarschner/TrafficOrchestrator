@@ -2,8 +2,10 @@
 package traffic
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"strconv"
 	"sync"
@@ -11,6 +13,12 @@ import (
 
 	"trafficorch/pkg/config"
 )
+
+// payloadSize is the number of random bytes sent in each TCP/UDP packet.
+const payloadSize = 64
+
+// errUnsupportedProtocol is a permanent (non-retriable) error for unknown protocols.
+var errUnsupportedProtocol = errors.New("unsupported protocol")
 
 // Generator handles creating network connections according to rules.
 type Generator struct {
@@ -23,7 +31,7 @@ func NewGenerator(rules []*config.TrafficRule) *Generator {
 }
 
 // GenerateTraffic executes traffic generation for all rules.
-// This is a blocking call that runs until all connections complete or context is cancelled.
+// This is a blocking call that runs until all connections complete.
 func (g *Generator) GenerateTraffic() error {
 	if len(g.rules) == 0 {
 		return fmt.Errorf("no traffic rules configured")
@@ -49,58 +57,91 @@ func (g *Generator) executeRule(rule *config.TrafficRule) {
 	connCount := 0
 
 	for {
-		if err := g.executeSingleConnection(rule); err != nil {
+		err := g.executeSingleConnection(rule)
+		if err != nil {
+			// Permanent failure (e.g. unsupported protocol) — exit immediately.
+			if errors.Is(err, errUnsupportedProtocol) {
+				log.Printf("traffic: rule %s: %v — skipping", rule.Name, err)
+				return
+			}
 			log.Printf("traffic: error creating connection for rule %s: %v", rule.Name, err)
+		} else {
+			connCount++
 		}
 
-		connCount++
-
-		// Check if we should stop
+		// Check if we should stop.
 		if rule.Count > 0 && connCount >= rule.Count {
 			break
 		}
 
-		// Wait before next connection (if interval specified)
+		// Wait before next connection.
 		if rule.Interval > 0 {
 			time.Sleep(time.Duration(rule.Interval) * time.Second)
 		} else {
-			time.Sleep(100 * time.Millisecond) // Small delay for immediate connections
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
 	log.Printf("traffic: rule %s completed: %d connections", rule.Name, connCount)
 }
 
-// executeSingleConnection creates a single connection according to the rule.
+// executeSingleConnection creates a single connection and sends a random payload.
+//
+// Bug fix (v0.3.0):
+//   - TCP: after dialling, write a random payload so the connection is visible
+//     to network monitoring tools and the remote listener receives data.
+//   - UDP: net.DialTimeout on UDP only creates a connected socket; no packet is
+//     sent until Write() is called. We now call Write(), which triggers the
+//     actual UDP datagram transmission.
 func (g *Generator) executeSingleConnection(rule *config.TrafficRule) error {
 	address := net.JoinHostPort(rule.Target, strconv.Itoa(rule.Port))
 
-	var conn net.Conn
-	var err error
+	payload := randomPayload(payloadSize)
 
 	switch rule.Protocol {
 	case "TCP":
-		conn, err = net.DialTimeout("tcp", address, 5*time.Second)
+		conn, err := net.DialTimeout("tcp", address, 5*time.Second)
+		if err != nil {
+			return fmt.Errorf("failed to connect TCP %s: %w", address, err)
+		}
+		defer conn.Close()
+
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, werr := conn.Write(payload); werr != nil {
+			log.Printf("traffic: TCP write to %s failed: %v", address, werr)
+		}
+
+		log.Printf("traffic: TCP connection established to %s (%d bytes sent)", address, len(payload))
+		time.Sleep(10 * time.Millisecond)
+
 	case "UDP":
-		conn, err = net.DialTimeout("udp", address, 5*time.Second)
+		conn, err := net.DialTimeout("udp", address, 5*time.Second)
+		if err != nil {
+			return fmt.Errorf("failed to open UDP socket to %s: %w", address, err)
+		}
+		defer conn.Close()
+
+		// Without Write(), no UDP datagram is ever transmitted.
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, werr := conn.Write(payload); werr != nil {
+			return fmt.Errorf("failed to send UDP datagram to %s: %w", address, werr)
+		}
+
+		log.Printf("traffic: UDP datagram sent to %s (%d bytes)", address, len(payload))
+
 	default:
-		return fmt.Errorf("unsupported protocol: %s", rule.Protocol)
-	}
-
-	if err != nil {
-		return fmt.Errorf("failed to connect %s %s: %w", rule.Protocol, address, err)
-	}
-
-	defer conn.Close()
-
-	// For TCP: Simulate a quick connection (3-way handshake + teardown)
-	if rule.Protocol == "TCP" {
-		log.Printf("traffic: TCP connection established to %s", address)
-		time.Sleep(10 * time.Millisecond) // Brief connection duration
-	} else if rule.Protocol == "UDP" {
-		log.Printf("traffic: UDP socket opened to %s", address)
-		// For UDP, we just need the connection established (no handshake)
+		return fmt.Errorf("%w: %s", errUnsupportedProtocol, rule.Protocol)
 	}
 
 	return nil
+}
+
+// randomPayload returns a slice of n pseudo-random printable ASCII bytes.
+func randomPayload(n int) []byte {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return b
 }

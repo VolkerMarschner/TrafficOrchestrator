@@ -53,29 +53,25 @@ func NewMasterServer(cfg *config.MasterConfig, logger *logging.Logger) (*MasterS
 	// Start file watcher for automatic config reload
 	go ms.watchConfigFile()
 
-	ms.logger.Info(fmt.Sprintf("Master server initialized on port %d", cfg.Port))
+	ms.logger.Info(fmt.Sprintf("Master server initialised on port %d (TTL=%ds)", cfg.Port, cfg.TTL))
 
 	return ms, nil
 }
 
 // onAgentRegister is called when a new agent registers.
+// It immediately distributes the current ruleset to the new agent.
 func (ms *MasterServer) onAgentRegister(agentID string, hostname string) {
 	ms.logger.Info(fmt.Sprintf("New agent registered: %s (%s)", agentID, hostname))
+
+	// Give the channel a moment to settle before pushing config.
+	time.Sleep(200 * time.Millisecond)
+
+	ms.distributeRulesToAgent(agentID)
 }
 
 // onTrafficRequest handles traffic generation requests from agents.
 func (ms *MasterServer) onTrafficRequest(agentID string, rules []*comm.TrafficRule) {
-	ms.ruleMu.RLock()
-	currentRules := make([]*config.TrafficRule, len(ms.rules))
-	copy(currentRules, ms.rules)
-	ms.ruleMu.RUnlock()
-
 	ms.logger.Info(fmt.Sprintf("Traffic request from %s: %d rules", agentID, len(rules)))
-
-	// Execute traffic generation (this would be implemented in the future)
-	if err := ms.executeTraffic(agentID, currentRules); err != nil {
-		ms.logger.Error(fmt.Sprintf("Error executing traffic: %v", err))
-	}
 }
 
 // loadConfig re-parses the configuration file from disk and updates the active rule set.
@@ -87,12 +83,10 @@ func (ms *MasterServer) loadConfig() error {
 
 	ms.ruleMu.Lock()
 	ms.rules = freshCfg.TrafficRules
+	ms.cfg.TTL = freshCfg.TTL
 	ms.ruleMu.Unlock()
 
-	ms.logger.Info(fmt.Sprintf("Loaded %d traffic rules from %s", len(freshCfg.TrafficRules), ms.configPath))
-	if len(freshCfg.TargetMap) > 0 {
-		ms.logger.Debug(fmt.Sprintf("Target map reloaded: %d entries", len(freshCfg.TargetMap)))
-	}
+	ms.logger.Info(fmt.Sprintf("Loaded %d traffic rules from %s (TTL=%ds)", len(freshCfg.TrafficRules), ms.configPath, freshCfg.TTL))
 	return nil
 }
 
@@ -110,48 +104,95 @@ func (ms *MasterServer) watchConfigFile() {
 			}
 
 			modTime := info.ModTime()
-
-			// Check if file was modified since last check
 			if !modTime.Equal(lastModTime) && !lastModTime.IsZero() {
 				ms.logger.Info("Config file changed, reloading...")
 				go ms.loadConfigAndNotify()
 			}
-
 			lastModTime = modTime
 
 		case <-ms.fileWatcher:
-			// Manual trigger from external signal
 			ms.logger.Info("Config reload triggered manually")
 			go ms.loadConfigAndNotify()
 		}
 	}
 }
 
-// loadConfigAndNotify loads config and notifies all agents.
+// loadConfigAndNotify reloads config and pushes updates to all agents.
 func (ms *MasterServer) loadConfigAndNotify() {
 	if err := ms.loadConfig(); err != nil {
 		ms.logger.Error(fmt.Sprintf("Failed to reload config: %v", err))
 		return
 	}
-
-	ms.notifyAgentsOfUpdate()
+	ms.notifyAllAgents()
 }
 
-// notifyAgentsOfUpdate sends config update to all registered agents.
-func (ms *MasterServer) notifyAgentsOfUpdate() {
+// notifyAllAgents distributes the current ruleset to every connected agent.
+func (ms *MasterServer) notifyAllAgents() {
+	agentIPs := ms.server.GetAgentIPs() // agentID → remoteIP
+	for agentID := range agentIPs {
+		ms.distributeRulesToAgent(agentID)
+	}
+}
+
+// distributeRulesToAgent builds a per-agent rule set and sends a CONFIG_UPDATE.
+//
+// Distribution logic (v0.3.0):
+//   - Rules with Source=="" (simple format): sent to ALL agents with Role="connect".
+//   - Rules with Source!="" (extended format):
+//     · If agent IP matches Source → sent with Role="connect".
+//     · If agent IP matches Target(Dest) → sent with Role="listen".
+//     · Otherwise the rule is not sent to that agent.
+func (ms *MasterServer) distributeRulesToAgent(agentID string) {
+	agentIPs := ms.server.GetAgentIPs()
+	agentIP := agentIPs[agentID]
+
 	ms.ruleMu.RLock()
-	rules := make([]*comm.TrafficRule, len(ms.rules))
-	for i, rule := range ms.rules {
-		rules[i] = &comm.TrafficRule{
-			Protocol: rule.Protocol,
-			Target:   rule.Target,
-			Port:     rule.Port,
-			Interval: rule.Interval,
-			Count:    rule.Count,
-			Name:     rule.Name,
+	allRules := ms.rules
+	ttl := ms.cfg.TTL
+	ms.ruleMu.RUnlock()
+
+	var agentRules []*comm.TrafficRule
+
+	for _, rule := range allRules {
+		if rule.Source == "" {
+			// Simple format — every agent acts as traffic generator.
+			agentRules = append(agentRules, &comm.TrafficRule{
+				Protocol: rule.Protocol,
+				Target:   rule.Target,
+				Port:     rule.Port,
+				Interval: rule.Interval,
+				Count:    rule.Count,
+				Name:     rule.Name,
+				Role:     "connect",
+			})
+		} else {
+			// Extended format — route by IP.
+			if agentIP == rule.Source {
+				agentRules = append(agentRules, &comm.TrafficRule{
+					Protocol: rule.Protocol,
+					Source:   rule.Source,
+					Target:   rule.Target,
+					Port:     rule.Port,
+					Count:    rule.Count,
+					Name:     rule.Name,
+					Role:     "connect",
+				})
+			} else if agentIP == rule.Target {
+				agentRules = append(agentRules, &comm.TrafficRule{
+					Protocol: rule.Protocol,
+					Port:     rule.Port,
+					Name:     rule.Name,
+					Role:     "listen",
+				})
+			}
+			// Agents with neither SOURCE nor DEST IP receive nothing for this rule.
 		}
 	}
-	ms.ruleMu.RUnlock()
+
+	if len(agentRules) == 0 {
+		ms.logger.Debug(fmt.Sprintf("No rules applicable to agent %s (IP=%s)", agentID, agentIP))
+		return
+	}
 
 	msg := &comm.ConfigUpdateMessage{
 		BaseMessage: comm.BaseMessage{
@@ -159,35 +200,23 @@ func (ms *MasterServer) notifyAgentsOfUpdate() {
 			Timestamp: time.Now().Unix(),
 			Version:   "1.0",
 		},
-		Rules: rules,
+		TTL:   ttl,
+		Rules: agentRules,
 	}
 
-	if err := ms.server.SendToAllAgents(msg); err != nil {
-		ms.logger.Error(fmt.Sprintf("Failed to notify agents of config update: %v", err))
+	if err := ms.server.SendToAgent(agentID, msg); err != nil {
+		ms.logger.Error(fmt.Sprintf("Failed to send config to agent %s: %v", agentID, err))
+	} else {
+		ms.logger.Info(fmt.Sprintf("Sent %d rules to agent %s (TTL=%ds)", len(agentRules), agentID, ttl))
 	}
 }
 
-// executeTraffic executes traffic generation according to the given rules.
-func (ms *MasterServer) executeTraffic(agentID string, rules []*config.TrafficRule) error {
-	if len(rules) == 0 {
-		return fmt.Errorf("no rules provided")
-	}
-
-	ms.logger.Info(fmt.Sprintf("Executing %d traffic rules for agent %s", len(rules), agentID))
-
-	// TODO: Implement actual traffic execution logic
-	// This would spawn goroutines to create network connections
-
-	return nil
-}
-
-// Start starts the master server and begins listening for agents.
+// Start starts the master server and blocks until a shutdown signal is received.
 func (ms *MasterServer) Start() error {
 	ms.logger.Info(fmt.Sprintf("Starting Traffic Orchestrator Master v%s", version))
 	ms.logger.Info(fmt.Sprintf("Listening on port %d with PSK authentication", ms.cfg.Port))
 	ms.logger.Info(fmt.Sprintf("Config file: %s (%d rules loaded)", ms.configPath, len(ms.rules)))
 
-	// Wait for shutdown signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
@@ -200,10 +229,7 @@ func (ms *MasterServer) Start() error {
 // Stop gracefully shuts down the master server.
 func (ms *MasterServer) Stop(logger *logging.Logger) error {
 	logger.Info("Shutting down Master server...")
-
-	// Close all agent connections
 	ms.server.CloseAllAgents()
-
 	return nil
 }
 

@@ -20,31 +20,32 @@ const hmacSize = 32
 
 // Channel represents a PSK-authenticated, length-prefixed message channel over a net.Conn.
 type Channel struct {
-	conn     net.Conn
-	psk      string
-	mu       sync.Mutex
-	lastRead time.Time
+	conn net.Conn
+	psk  string
+	mu   sync.Mutex
 }
 
 // NewChannel wraps an existing net.Conn in a Channel using the given pre-shared key.
 func NewChannel(conn net.Conn, psk string) *Channel {
-	return &Channel{
-		conn:     conn,
-		psk:      psk,
-		lastRead: time.Now(),
-	}
+	return &Channel{conn: conn, psk: psk}
 }
 
 // ReadMessage reads and HMAC-validates one message from the channel.
-// It returns both the parsed BaseMessage (for type dispatch) and the raw JSON bytes
-// (for full deserialization into a concrete message type).
+// A read deadline equal to ChannelIdleTimeout is set before each read so that
+// permanently-silent connections are eventually cleaned up.
+// Returns the parsed BaseMessage (for type dispatch) and the raw JSON bytes.
 func (c *Channel) ReadMessage() (*BaseMessage, []byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Set a per-read deadline so idle connections are not held open forever.
+	if err := c.conn.SetReadDeadline(time.Now().Add(ChannelIdleTimeout)); err != nil {
+		return nil, nil, fmt.Errorf("failed to set read deadline: %w", err)
+	}
+
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(c.conn, lenBuf[:]); err != nil {
-		return nil, nil, fmt.Errorf("failed to read message length: %w", err)
+		return nil, nil, err // caller checks net.Error.Timeout()
 	}
 	msgLen := binary.BigEndian.Uint32(lenBuf[:])
 
@@ -53,7 +54,8 @@ func (c *Channel) ReadMessage() (*BaseMessage, []byte, error) {
 		return nil, nil, fmt.Errorf("failed to read message body: %w", err)
 	}
 
-	c.lastRead = time.Now()
+	// Clear the deadline after a successful read.
+	_ = c.conn.SetReadDeadline(time.Time{})
 
 	if len(body) < hmacSize {
 		return nil, nil, fmt.Errorf("message too short: need at least %d bytes for HMAC", hmacSize)
@@ -110,11 +112,6 @@ func (c *Channel) signMessage(data []byte) []byte {
 	return h.Sum(nil)
 }
 
-// ConnectionTimeout reports whether the channel has been idle longer than ChannelIdleTimeout.
-func (c *Channel) ConnectionTimeout() bool {
-	return time.Since(c.lastRead) > ChannelIdleTimeout
-}
-
 // Close closes the underlying network connection.
 func (c *Channel) Close() error {
 	c.mu.Lock()
@@ -125,19 +122,27 @@ func (c *Channel) Close() error {
 	return nil
 }
 
+// ─── Master-side ─────────────────────────────────────────────────────────────
+
+// agentConn bundles a Channel with metadata about the connected agent.
+type agentConn struct {
+	channel  *Channel
+	remoteIP string // extracted from TCP remote address (or self-reported by agent)
+	hostname string // self-reported in REGISTER
+}
+
 // MasterServer listens for incoming agent connections and dispatches messages.
 type MasterServer struct {
 	listener   net.Listener
 	psk        string
-	agents     map[string]*Channel
+	agents     map[string]*agentConn
 	mu         sync.RWMutex
 	onRegister func(agentID string, hostname string)
 	onTraffic  func(agentID string, rules []*TrafficRule)
 }
 
-// NewMasterServer creates a MasterServer that listens on port, authenticates with psk,
-// and calls onRegister when an agent registers and onTraffic when traffic is requested.
-// onTraffic may be nil if the caller does not handle traffic requests directly.
+// NewMasterServer creates a MasterServer that listens on port, authenticates
+// with psk, and invokes the supplied callbacks.
 func NewMasterServer(psk string, port int, onRegister func(string, string), onTraffic func(string, []*TrafficRule)) (*MasterServer, error) {
 	addr := fmt.Sprintf(":%d", port)
 	listener, err := net.Listen("tcp", addr)
@@ -148,7 +153,7 @@ func NewMasterServer(psk string, port int, onRegister func(string, string), onTr
 	server := &MasterServer{
 		listener:   listener,
 		psk:        psk,
-		agents:     make(map[string]*Channel),
+		agents:     make(map[string]*agentConn),
 		onRegister: onRegister,
 		onTraffic:  onTraffic,
 	}
@@ -170,6 +175,12 @@ func (s *MasterServer) acceptLoop() {
 }
 
 func (s *MasterServer) handleConnection(conn net.Conn) {
+	// Extract agent IP from the TCP remote address.
+	remoteIP := ""
+	if host, _, err := net.SplitHostPort(conn.RemoteAddr().String()); err == nil {
+		remoteIP = host
+	}
+
 	channel := NewChannel(conn, s.psk)
 	defer channel.Close()
 
@@ -184,7 +195,6 @@ func (s *MasterServer) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// CQ-2: Check Unmarshal error
 	var regMsg RegisterMessage
 	if err := json.Unmarshal(msgBytes, &regMsg); err != nil {
 		log.Printf("comm: failed to parse REGISTER from %s: %v", conn.RemoteAddr(), err)
@@ -196,8 +206,17 @@ func (s *MasterServer) handleConnection(conn net.Conn) {
 		return
 	}
 
+	// Prefer self-reported IP (useful behind NAT); fall back to socket remote addr.
+	if regMsg.AgentIP != "" {
+		remoteIP = regMsg.AgentIP
+	}
+
 	s.mu.Lock()
-	s.agents[regMsg.AgentID] = channel
+	s.agents[regMsg.AgentID] = &agentConn{
+		channel:  channel,
+		remoteIP: remoteIP,
+		hostname: regMsg.Hostname,
+	}
 	s.mu.Unlock()
 
 	if s.onRegister != nil {
@@ -225,15 +244,13 @@ func (s *MasterServer) handleConnection(conn net.Conn) {
 
 func (s *MasterServer) processMessages(channel *Channel, agentID string) {
 	for {
-		if channel.ConnectionTimeout() {
-			log.Printf("comm: agent %s connection timed out", agentID)
-			s.removeAgent(agentID)
-			return
-		}
-
 		msg, msgBytes, err := channel.ReadMessage()
 		if err != nil {
-			log.Printf("comm: lost connection to agent %s: %v", agentID, err)
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("comm: agent %s channel idle timeout — disconnecting", agentID)
+			} else {
+				log.Printf("comm: lost connection to agent %s: %v", agentID, err)
+			}
 			s.removeAgent(agentID)
 			return
 		}
@@ -264,6 +281,14 @@ func (s *MasterServer) processMessages(channel *Channel, agentID string) {
 			}
 			log.Printf("comm: agent %s reported error [%s]: %s", agentID, errMsg.Code, errMsg.Message)
 
+		case MsgWarning:
+			var warnMsg WarningMessage
+			if err := json.Unmarshal(msgBytes, &warnMsg); err != nil {
+				log.Printf("comm: failed to parse warning from %s: %v", agentID, err)
+				continue
+			}
+			log.Printf("comm: WARNING from agent %s [%s]: %s", agentID, warnMsg.Code, warnMsg.Message)
+
 		default:
 			log.Printf("comm: unknown message type %q from agent %s", msg.Type, agentID)
 		}
@@ -273,8 +298,8 @@ func (s *MasterServer) processMessages(channel *Channel, agentID string) {
 func (s *MasterServer) removeAgent(agentID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if ch, ok := s.agents[agentID]; ok {
-		ch.Close()
+	if ac, ok := s.agents[agentID]; ok {
+		ac.channel.Close()
 		delete(s.agents, agentID)
 	}
 }
@@ -290,26 +315,37 @@ func (s *MasterServer) GetAgents() []string {
 	return ids
 }
 
-// StartTraffic sends a traffic-start command with the given rules to one agent (by ID)
-// or to all agents if agentID is empty.
+// GetAgentIPs returns a map of agentID → remoteIP for all connected agents.
+// Used by the master to match agents against SOURCE/DEST IPs in extended rules.
+func (s *MasterServer) GetAgentIPs() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m := make(map[string]string, len(s.agents))
+	for id, ac := range s.agents {
+		m[id] = ac.remoteIP
+	}
+	return m
+}
+
+// StartTraffic sends a traffic-start command to one agent (by ID) or all agents.
 func (s *MasterServer) StartTraffic(agentID string, rules []*TrafficRule) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	if agentID == "" {
-		for id, channel := range s.agents {
+		for id, ac := range s.agents {
 			msg := &TrafficStartMessage{
 				BaseMessage: BaseMessage{Type: MsgTrafficStart, Timestamp: time.Now().Unix(), Version: ProtocolVersion},
 				Rules:       rules,
 			}
-			if err := channel.WriteMessage(msg); err != nil {
+			if err := ac.channel.WriteMessage(msg); err != nil {
 				log.Printf("comm: failed to send traffic-start to agent %s: %v", id, err)
 			}
 		}
 		return nil
 	}
 
-	channel, ok := s.agents[agentID]
+	ac, ok := s.agents[agentID]
 	if !ok {
 		return fmt.Errorf("agent %q not found", agentID)
 	}
@@ -318,27 +354,27 @@ func (s *MasterServer) StartTraffic(agentID string, rules []*TrafficRule) error 
 		AgentID:     agentID,
 		Rules:       rules,
 	}
-	return channel.WriteMessage(msg)
+	return ac.channel.WriteMessage(msg)
 }
 
-// StopTraffic sends a traffic-stop command to one agent (by ID) or all agents if agentID is empty.
+// StopTraffic sends a traffic-stop command to one agent (by ID) or all agents.
 func (s *MasterServer) StopTraffic(agentID string) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	if agentID == "" {
-		for id, channel := range s.agents {
+		for id, ac := range s.agents {
 			msg := &TrafficStopMessage{
 				BaseMessage: BaseMessage{Type: MsgTrafficStop, Timestamp: time.Now().Unix(), Version: ProtocolVersion},
 			}
-			if err := channel.WriteMessage(msg); err != nil {
+			if err := ac.channel.WriteMessage(msg); err != nil {
 				log.Printf("comm: failed to send traffic-stop to agent %s: %v", id, err)
 			}
 		}
 		return nil
 	}
 
-	channel, ok := s.agents[agentID]
+	ac, ok := s.agents[agentID]
 	if !ok {
 		return fmt.Errorf("agent %q not found", agentID)
 	}
@@ -346,32 +382,44 @@ func (s *MasterServer) StopTraffic(agentID string) error {
 		BaseMessage: BaseMessage{Type: MsgTrafficStop, Timestamp: time.Now().Unix(), Version: ProtocolVersion},
 		AgentID:     agentID,
 	}
-	return channel.WriteMessage(msg)
+	return ac.channel.WriteMessage(msg)
 }
 
 // CloseAllAgents closes every active agent connection and resets the agent map.
 func (s *MasterServer) CloseAllAgents() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, ch := range s.agents {
-		ch.Close()
+	for _, ac := range s.agents {
+		ac.channel.Close()
 	}
-	s.agents = make(map[string]*Channel)
+	s.agents = make(map[string]*agentConn)
 }
 
 // SendToAllAgents broadcasts msg to every connected agent.
-// Individual send failures are logged but do not abort the broadcast.
 func (s *MasterServer) SendToAllAgents(msg interface{}) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	for id, channel := range s.agents {
-		if err := channel.WriteMessage(msg); err != nil {
+	for id, ac := range s.agents {
+		if err := ac.channel.WriteMessage(msg); err != nil {
 			log.Printf("comm: failed to send to agent %s: %v", id, err)
 		}
 	}
 	return nil
 }
+
+// SendToAgent sends msg to a single agent identified by agentID.
+func (s *MasterServer) SendToAgent(agentID string, msg interface{}) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ac, ok := s.agents[agentID]
+	if !ok {
+		return fmt.Errorf("agent %q not found", agentID)
+	}
+	return ac.channel.WriteMessage(msg)
+}
+
+// ─── Agent-side ───────────────────────────────────────────────────────────────
 
 // AgentClient manages the connection from an agent to the master.
 type AgentClient struct {
@@ -400,7 +448,6 @@ func NewAgentClient(master string, port int, psk string) (*AgentClient, error) {
 }
 
 // Register sends a REGISTER message to the master and waits for acknowledgement.
-// It also dispatches an initial heartbeat in the background to keep the connection alive.
 func (c *AgentClient) Register(agentID string, hostname string, platform string) error {
 	msg := &RegisterMessage{
 		BaseMessage: BaseMessage{
@@ -435,7 +482,7 @@ func (c *AgentClient) Register(agentID string, hostname string, platform string)
 		return fmt.Errorf("registration rejected by master: %s", ack.Message)
 	}
 
-	// Send an initial heartbeat shortly after registration to confirm the connection.
+	// Send an initial heartbeat to confirm the channel is alive.
 	go func() {
 		time.Sleep(1 * time.Second)
 		_ = c.SendHeartbeat(0.0, 0, 0)
@@ -468,6 +515,21 @@ func (c *AgentClient) SendHeartbeat(cpuUsage float64, memoryUsage int64, activeR
 		CPUUsage:    cpuUsage,
 		MemoryUsage: memoryUsage,
 		ActiveRules: activeRules,
+	}
+	return c.channel.WriteMessage(msg)
+}
+
+// SendWarning sends a non-fatal warning message to the master.
+func (c *AgentClient) SendWarning(agentID, code, message string) error {
+	msg := &WarningMessage{
+		BaseMessage: BaseMessage{
+			Type:      MsgWarning,
+			Timestamp: time.Now().Unix(),
+			Version:   ProtocolVersion,
+		},
+		AgentID: agentID,
+		Code:    code,
+		Message: message,
 	}
 	return c.channel.WriteMessage(msg)
 }

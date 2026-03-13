@@ -1,9 +1,9 @@
 # Traffic Orchestrator — Technical Architecture
 
-**Version:** 0.2
+**Version:** 0.3
 **Author:** Claudia (Lead Architect)
 **Date:** 2026-03-13
-**Status:** ✅ Updated — v0.2.0 agent.conf feature incorporated
+**Status:** ✅ Updated — v0.3.0 standalone mode, TTL, listener roles, non-root warning, payload fix incorporated
 
 ---
 
@@ -451,29 +451,95 @@ go func() {
 ### 7.1 Startup Sequence
 
 ```
-1. Determine configuration source:
+1. Determine configuration source (priority order):
    a. CLI flags given (--agent --master … --port … --psk …)
-      → parse flags → save to agent.conf → proceed
+      → parse flags → save to agent.conf → attempt connected mode
    b. No flags / --agent with no flags
       → look for agent.conf in working directory
-      → found:     load and proceed
-      → not found: print help, exit 0
-2. Validate PSK strength (SEC-5)
-3. Establish TCP connection to Master (HMAC-SHA256 authenticated channel)
-4. Send REGISTER message
-5. Wait for REGISTER_ACK from Master
-6. Enter message loop:
-   - Receive CONFIG_UPDATE → apply new traffic rules
-   - Receive TRAFFIC_START → begin generating traffic
-   - Receive TRAFFIC_STOP  → halt traffic goroutines
-7. Send HEARTBEAT every 30 s
-8. On SIGINT/SIGTERM → graceful shutdown
+        → found:     load and attempt connected mode (step 2)
+        → not found: look for instructions.conf (standalone mode, step 3)
+        → neither:   print help, exit 0
+
+2. Connected mode (requires live master):
+   a. Validate PSK strength
+   b. Dial TCP to master; if unreachable → fall back to standalone (step 3)
+   c. Send REGISTER message (includes self-reported IP)
+   d. Receive REGISTER_ACK
+   e. Check non-root privilege (see §7.4); send WARNING to master if non-root
+   f. Enter message loop:
+      - Receive CONFIG_UPDATE → save rules to instructions.conf → apply rules
+      - Receive TRAFFIC_START → begin generating traffic
+   g. Send HEARTBEAT every 30 s
+   h. On SIGINT/SIGTERM → stop listeners, cancel goroutines, exit
+
+3. Standalone mode (no live master required):
+   a. Load instructions.conf; verify it exists and is not expired (TTL check)
+   b. Check non-root privilege; log warning locally
+   c. Apply cached rules (start "listen" listeners, launch "connect" goroutines)
+   d. Launch TTL reconnect goroutine (see §7.3)
+   e. On SIGINT/SIGTERM → stop listeners, cancel goroutines, exit
 ```
 
 **agent.conf** (introduced in v0.2.0) is a simple KEY=VALUE file written
 atomically (temp file + rename) to the working directory whenever an agent
 is started with explicit CLI flags.  All four keys are supported:
 `MASTER`, `PORT`, `PSK`, `ID`.
+
+**instructions.conf** (introduced in v0.3.0) is a JSON file written whenever
+the agent receives a `CONFIG_UPDATE` from the master.  It stores the full
+rule set, the master connection parameters, a `received_at` timestamp, and the
+TTL (time-to-live in seconds, 0 = never expires).  Permissions are set to
+0600.  Atomic write (temp file + rename) prevents partial reads.
+
+### 7.2 Rule Roles — connect vs listen
+
+Starting with v0.3.0 each traffic rule carries a `role` field:
+
+| Role | Behaviour |
+|------|-----------|
+| `connect` | Agent dials the target host:port and sends a random 64-byte payload |
+| `listen` | Agent opens a TCP/UDP listener on the specified port and accepts incoming connections/datagrams |
+
+**Rule distribution by the master (extended config format):**
+- Source agent IP matches rule `SOURCE` → rule sent with `role=connect`
+- Dest agent IP matches rule `DEST` → rule sent with `role=listen`
+- Simple format (no SOURCE field) → all agents receive `role=connect`
+
+### 7.3 TTL Reconnect Loop
+
+When an agent runs in standalone mode with a finite TTL, a background
+goroutine waits for `TTL` seconds and then attempts to reconnect to the
+master.  The retry loop uses a 30 s back-off between attempts.  On success
+the agent switches back to connected mode and rewrites `instructions.conf`
+with the fresh rules received from the master.
+
+```
+standalone start
+      │
+      ▼
+apply cached rules
+      │
+      └─► [TTL goroutine]
+               │
+               ▼  (wait TTL seconds)
+          dial master
+               │
+          ┌────┴─────┐
+          │ success  │ failure (retry every 30 s)
+          ▼          └──────────────────────────┐
+     receive CONFIG_UPDATE                      │
+     save instructions.conf              keep retrying
+     apply new rules                            │
+     (now in connected mode)   ◄────────────────┘
+```
+
+### 7.4 Non-root Warning
+
+On Linux and macOS the agent checks `os.Getuid()` at startup:
+- If non-root: a warning is printed to stderr AND logged.
+- In connected mode: a `WARNING` message is also sent to the master's log.
+- Impact: port binding will fail for ports ≤ 1024; configure only ports > 1024
+  for non-root agents.
 
 ### 7.2 Command Execution
 
@@ -964,6 +1030,6 @@ This architecture provides a **secure, scalable, and maintainable** foundation f
 
 ---
 
-**Document Status:** 🟡 Draft — Awaiting feedback  
-**Next Reviewer:** Kathy (QA/Security perspective)  
-**After Review:** Present to Volker for final approval
+**Document Status:** ✅ Updated — v0.3.0 implemented and tested
+**Last updated:** 2026-03-13
+**Changes in v0.3.0:** Standalone mode (instructions.conf + TTL), rule roles (connect/listen), port listener manager, non-root warning, random payload fix, smart rule distribution by agent IP

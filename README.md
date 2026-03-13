@@ -1,7 +1,7 @@
 # Traffic Orchestrator
 
 A lightweight, cross-platform network traffic generator for lab and demo environments.
-It creates realistic Layer 3/4 flows (TCP connections, UDP datagrams) between hosts — **no payload content**, just connection-level activity.
+It creates realistic Layer 3/4 flows (TCP connections, UDP datagrams) between hosts — including a random payload in every packet for realistic traffic visibility.
 
 ---
 
@@ -13,6 +13,8 @@ It creates realistic Layer 3/4 flows (TCP connections, UDP datagrams) between ho
 - [Usage](#usage)
   - [Master mode](#master-mode)
   - [Agent mode](#agent-mode)
+  - [Auto-start via agent.conf](#auto-start-via-agentconf)
+  - [Standalone mode via instructions.conf](#standalone-mode-via-instructionsconf)
   - [Environment variables](#environment-variables)
 - [Configuration file format](#configuration-file-format)
   - [Simple format](#simple-format-legacy)
@@ -153,13 +155,13 @@ trafficorch --agent \
 
 The agent will:
 1. Connect and register with the master
-2. Receive traffic rules
-3. Generate TCP/UDP connections according to those rules
+2. Receive traffic rules and save them to `instructions.conf`
+3. Generate TCP/UDP connections (connect rules) and open port listeners (listen rules)
 4. Send periodic heartbeats (every 30 s) with basic resource metrics
 
 > **Tip:** When CLI flags are supplied, trafficorch saves them to `agent.conf`
-> in the current directory.  On every subsequent start without arguments the
-> saved configuration is loaded automatically — no need to repeat the flags.
+> and the rules received from the master are saved to `instructions.conf`.
+> On the next start without arguments both files are used automatically.
 
 ### Auto-start via agent.conf
 
@@ -186,6 +188,54 @@ ID=host-a
 
 All four keys are supported: `MASTER`, `PORT`, `PSK`, `ID` (optional).
 Inline comments (`# …`) are stripped automatically.
+
+### Standalone mode via instructions.conf
+
+Starting from **v0.3.0**, agents can operate without a permanent master connection.
+
+When an agent receives a `CONFIG_UPDATE` from the master it automatically writes
+`instructions.conf` to the current directory.  This JSON file stores the traffic
+rules, a timestamp, and a **TTL** (time-to-live in seconds, set by the master).
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Master reachable | Normal connected mode; rules saved to `instructions.conf` |
+| Master unreachable; `instructions.conf` exists and not expired | Standalone mode: agent enforces cached rules |
+| TTL expires | Agent reconnects to master automatically; falls back if unreachable |
+| Master pushes new rules at any time | Agent updates and rewrites `instructions.conf` |
+
+**TTL configuration** (in master config file):
+
+```ini
+[MASTER]
+PORT = 9000
+PSK  = YourKey123
+TTL  = 3600          # agents refresh instructions every hour (0 = never expire)
+```
+
+**instructions.conf** (auto-generated, pretty-printed JSON):
+
+```json
+{
+  "received_at": "2026-03-13T10:00:00Z",
+  "ttl": 3600,
+  "master": "192.168.1.1",
+  "port": 9000,
+  "psk": "YourKey123",
+  "agent_id": "host-a",
+  "rules": [...]
+}
+```
+
+> Delete `instructions.conf` to force a full re-sync from the master on next start.
+
+### Non-root warning
+
+On Linux and macOS, if the agent runs as a non-root user:
+
+- A warning is printed to stderr.
+- The warning is sent to the master log.
+- Port binding will fail for ports ≤ 1024 — configure only ports > 1024 for such agents.
 
 ### Other flags
 
@@ -326,11 +376,12 @@ TrafficOrchestrator/
 │   │   └── constants.go    # Protocol timeouts and version
 │   │
 │   ├── config/             # Configuration parsing
-│   │   ├── parser.go       # CLI arg parsing, legacy file parser
-│   │   ├── parser_v2.go    # Primary config parser (extended format)
-│   │   ├── parser_extended.go  # Extended SOURCE/DEST format
+│   │   ├── parser.go       # CLI arg parsing, TrafficRule type
+│   │   ├── parser_v2.go    # Primary config parser (simple + extended format, TTL)
+│   │   ├── parser_extended.go  # Extended SOURCE/DEST format (legacy)
 │   │   ├── parser_smart.go # Auto-detects format, falls back to legacy
 │   │   ├── agent_conf.go   # agent.conf load/save (v0.2.0+)
+│   │   ├── instructions_conf.go # instructions.conf load/save (v0.3.0+)
 │   │   └── constants.go    # Port defaults, sentinel values
 │   │
 │   ├── logging/            # Rotating file logger
@@ -343,7 +394,8 @@ TrafficOrchestrator/
 │   │   └── security.go
 │   │
 │   └── traffic/            # Traffic generation engine
-│       └── generator.go
+│       ├── generator.go    # TCP/UDP connection generator (with random payload)
+│       └── listener.go     # TCP/UDP port listener manager (v0.3.0+)
 │
 ├── configs/                # Config templates (safe to commit)
 │   ├── traffic-simple.conf.example
@@ -442,6 +494,21 @@ Use an absolute path or run from the directory that contains the file:
 ```bash
 trafficorch --master --config /etc/trafficorch/traffic.conf
 ```
+
+### Agent starts in standalone mode unexpectedly
+
+The master was unreachable and `instructions.conf` exists from a previous run.
+Either fix the master connectivity, or delete the file to force a fresh start:
+
+```bash
+rm instructions.conf
+```
+
+### Agent not generating traffic after TTL expiry
+
+The agent is trying to reconnect to the master. Check the `agent.log` for
+reconnect attempts. If the master is down, the agent keeps retrying every 30 s
+while continuing to enforce the last known rules.
 
 ### Agent starts with wrong parameters
 

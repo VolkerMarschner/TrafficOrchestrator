@@ -21,14 +21,16 @@ func logf(format string, args ...interface{}) {
 	}
 }
 
-// TrafficRule defines a single traffic generation rule (legacy format: TARGET only)
+// TrafficRule defines a single traffic generation rule.
 type TrafficRule struct {
-	Protocol string // "TCP" or "UDP"
-	Target   string // Target name or IP address (resolved from targetMap)
-	Port     int    // Port number
-	Interval int    // Seconds between connections (0 = no interval, immediate)
-	Count    int    // Number of connections (-1 = loop forever)
-	Name     string // Optional human-readable name (e.g., "SMB")
+	Protocol string `json:"protocol"`          // "TCP" or "UDP"
+	Source   string `json:"source,omitempty"`  // Source IP (extended format only; empty = all agents)
+	Target   string `json:"target,omitempty"`  // Destination IP (empty for "listen" rules)
+	Port     int    `json:"port"`              // Port number
+	Interval int    `json:"interval"`          // Seconds between connections (0 = immediate)
+	Count    int    `json:"count"`             // Number of connections (-1 = loop forever)
+	Name     string `json:"name,omitempty"`    // Optional human-readable name (e.g., "SMB")
+	Role     string `json:"role,omitempty"`    // "connect" (dial out) or "listen" (open port); default = "connect"
 }
 
 // ExtendedTrafficRule defines a traffic rule with SOURCE and DESTINATION
@@ -54,8 +56,9 @@ type ExtendedConfig struct {
 type MasterConfig struct {
 	Port         int
 	PSK          string
+	TTL          int               // Seconds agents should cache instructions (0 = no expiry)
 	ConfigPath   string
-	TrafficRules []*TrafficRule // Loaded from config file
+	TrafficRules []*TrafficRule    // Loaded from config file
 	TargetMap    map[string]string // name -> IP mapping (for SOURCE/DEST routing)
 }
 
