@@ -1,0 +1,47 @@
+# ============================================================
+# Traffic Orchestrator — Master config with Profile system
+# v0.4.0 example
+#
+# Save as  to.conf  and run  ./trafficorch  (no arguments).
+# ============================================================
+
+[MASTER]
+PORT        = 9000
+PSK         = ChangeMe2026!
+TTL         = 300
+PROFILE_DIR = ./profiles     # directory containing *.profile files
+
+# ─── Named targets ───────────────────────────────────────────
+# Format:  NAME = IP  [#tag:<tagname>]
+#
+# Tags are used in profile rules via  group:<tagname>
+# Multiple tags per host: repeat  #tag:  tokens (comma is also OK)
+
+[TARGETS]
+DC1         = 10.0.0.1   #tag:dc
+DC2         = 10.0.0.2   #tag:dc
+CLIENT1     = 10.0.0.10  #tag:client
+CLIENT2     = 10.0.0.11  #tag:client
+WEB1        = 10.0.0.20  #tag:web
+FS1         = 10.0.0.30  #tag:fileserver
+
+# ─── Profile assignments ──────────────────────────────────────
+# Format:  <host-IP or target-name> = <profile>[, <profile>, ...]
+#
+# Multiple profiles are merged — rules from all assigned profiles
+# are applied to the agent.
+
+[ASSIGNMENTS]
+DC1         = domain_controller
+DC2         = domain_controller
+CLIENT1     = windows_client
+CLIENT2     = windows_client
+WEB1        = web_server
+FS1         = base_windows
+
+# ─── Optional direct rules (legacy format, fully compatible) ──
+# Direct rules and profile rules are additive.
+# Leave this section empty to rely entirely on profiles.
+
+[RULES]
+# TCP   SELF  ANY   9999  60  1   #custom-keepalive

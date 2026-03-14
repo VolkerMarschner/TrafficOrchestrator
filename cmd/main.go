@@ -12,7 +12,7 @@ import (
 	"trafficorch/pkg/netutils"
 )
 
-const version = "0.3.1"
+const version = "0.4.0"
 
 func main() {
 	// No arguments: try to.conf → print help.

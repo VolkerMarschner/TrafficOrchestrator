@@ -19,6 +19,7 @@ It creates realistic Layer 3/4 flows (TCP connections, UDP datagrams) between ho
 - [Configuration file format](#configuration-file-format)
   - [Simple format](#simple-format-legacy)
   - [Extended format](#extended-format-source--dest)
+  - [Profile system](#profile-system-v040)
 - [Architecture](#architecture)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -324,6 +325,100 @@ A full template is at [`configs/traffic-extended.conf.example`](configs/traffic-
 
 ---
 
+### Profile system (v0.4.0)
+
+The profile system lets you define **reusable traffic roles** and assign them to
+hosts, rather than writing per-host rules.  It is fully backward compatible —
+existing configs with direct rules continue to work unchanged.
+
+#### How it works
+
+1. Create `.profile` files in a `profiles/` directory.
+2. Tag your target hosts (e.g. `#tag:dc`, `#tag:client`).
+3. Add a `PROFILE_DIR` key and an `[ASSIGNMENTS]` section to your master config.
+
+**Master config with profiles (`to.conf`):**
+
+```ini
+[MASTER]
+PORT        = 9000
+PSK         = ChangeMe2026!
+TTL         = 300
+PROFILE_DIR = ./profiles
+
+[TARGETS]
+DC1     = 10.0.0.1   #tag:dc
+DC2     = 10.0.0.2   #tag:dc
+CLIENT1 = 10.0.0.10  #tag:client
+WEB1    = 10.0.0.20  #tag:web
+
+[ASSIGNMENTS]
+DC1     = domain_controller
+DC2     = domain_controller
+CLIENT1 = windows_client
+WEB1    = web_server
+```
+
+#### Profile file format
+
+```ini
+# profiles/windows_client.profile
+
+[META]
+NAME        = windows_client
+DESCRIPTION = Windows workstation joined to AD domain
+VERSION     = 1.0
+EXTENDS     = base_windows        # inherit rules from another profile
+
+[RULES]
+# PROTOCOL  ROLE     SRC   DST           PORT  INTERVAL  COUNT  #name
+TCP          connect  SELF  group:dc      389   20        3      #ldap-query
+UDP          connect  SELF  group:dc      53    10        2      #dns-query
+TCP          connect  SELF  group:dc      88    15        2      #kerberos
+TCP          listen   SELF  -             3389  -         -      #rdp-inbound
+```
+
+**Rule columns:**
+
+| Column | Values | Notes |
+|--------|--------|-------|
+| `PROTOCOL` | `TCP` / `UDP` | |
+| `ROLE` | `connect` / `listen` | `connect` = dial out; `listen` = open port |
+| `SRC` | `SELF`, IP, target name | `SELF` resolves to this agent's own IP |
+| `DST` | `SELF`, IP, target, `group:<tag>`, `ANY`, `-` | `-` = not used (listen rules) |
+| `PORT` | 1–65535 | |
+| `INTERVAL` | seconds or `-` | `-` = immediate |
+| `COUNT` | number, `loop`, or `-` | `-` or `loop` = repeat forever |
+| `#name` | optional | trailing inline label |
+
+Column spacing is not significant — any number of spaces or tabs works.
+
+**Destination placeholders:**
+
+| Placeholder | Resolves to |
+|-------------|-------------|
+| `SELF` | This agent's own IP |
+| `group:dc` | All IPs tagged `#tag:dc` in `[TARGETS]` |
+| `ANY` | All IPs in `[TARGETS]` |
+| `DC1` | The IP mapped to the name `DC1` |
+| `10.0.0.1` | Used as-is |
+| `-` | Empty — only valid for listen rules |
+
+**Inheritance:** Use `EXTENDS = base_windows` in `[META]` to inherit all rules from
+a parent profile.  The child's own rules are appended after the parent's.
+
+**Multi-profile assignment:** A host can be assigned more than one profile — their
+rules are merged:
+
+```ini
+CLIENT1 = windows_client, rdp_heavy
+```
+
+A set of ready-to-use example profiles is included in the [`profiles/`](profiles/)
+directory.
+
+---
+
 ## Architecture
 
 ```
@@ -364,7 +459,7 @@ Agent                          Master
 ```
 TrafficOrchestrator/
 ├── cmd/                    # Binary entry point
-│   ├── main.go             # CLI parsing, mode dispatch
+│   ├── main.go             # CLI parsing, mode dispatch, auto-start
 │   ├── master.go           # Master server wrapper (cmd layer)
 │   ├── agent.go            # Agent wrapper (cmd layer)
 │   └── constants.go        # Timing and defaults
@@ -376,18 +471,19 @@ TrafficOrchestrator/
 │   │   └── constants.go    # Protocol timeouts and version
 │   │
 │   ├── config/             # Configuration parsing
-│   │   ├── parser.go       # CLI arg parsing, TrafficRule type
-│   │   ├── parser_v2.go    # Primary config parser (simple + extended format, TTL)
-│   │   ├── parser_extended.go  # Extended SOURCE/DEST format (legacy)
-│   │   ├── parser_smart.go # Auto-detects format, falls back to legacy
-│   │   ├── agent_conf.go   # to.conf / agent.conf load/save (v0.2.0+)
+│   │   ├── parser.go       # CLI arg parsing, TrafficRule / MasterConfig types
+│   │   ├── parser_v2.go    # Primary config parser (simple + extended + profiles)
+│   │   ├── parser_extended.go   # Extended SOURCE/DEST format (legacy)
+│   │   ├── parser_smart.go      # Auto-detects format, falls back to legacy
+│   │   ├── profile.go      # Profile file parser + rule resolver (v0.4.0)
+│   │   ├── agent_conf.go   # to.conf load/save + mode detection (v0.3.1+)
 │   │   ├── instructions_conf.go # instructions.conf load/save (v0.3.0+)
 │   │   └── constants.go    # Port defaults, sentinel values
 │   │
 │   ├── logging/            # Rotating file logger
 │   │   └── logger.go
 │   │
-│   ├── master/             # Master server (pkg layer)
+│   ├── master/             # Master server (pkg layer, legacy)
 │   │   └── server.go
 │   │
 │   ├── netutils/           # PSK verification, strength validation
@@ -397,9 +493,16 @@ TrafficOrchestrator/
 │       ├── generator.go    # TCP/UDP connection generator (with random payload)
 │       └── listener.go     # TCP/UDP port listener manager (v0.3.0+)
 │
+├── profiles/               # Example .profile files (v0.4.0)
+│   ├── base_windows.profile
+│   ├── domain_controller.profile
+│   ├── windows_client.profile
+│   └── web_server.profile
+│
 ├── configs/                # Config templates (safe to commit)
 │   ├── traffic-simple.conf.example
-│   └── traffic-extended.conf.example
+│   ├── traffic-extended.conf.example
+│   └── to-profiles.conf.example    # Profile-based master config (v0.4.0)
 │
 ├── .env.example            # Environment variable template
 ├── .gitignore

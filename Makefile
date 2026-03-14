@@ -1,5 +1,5 @@
 BINARY  := trafficorch
-VERSION := 0.3.1
+VERSION := 0.4.0
 PKG     := ./cmd
 
 # Embed version at link-time

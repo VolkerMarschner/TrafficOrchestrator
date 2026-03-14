@@ -1,9 +1,9 @@
 # Traffic Orchestrator — Technical Architecture
 
-**Version:** 0.3
+**Version:** 0.4
 **Author:** Claudia (Lead Architect)
 **Date:** 2026-03-13
-**Status:** ✅ Updated — v0.3.0 standalone mode, TTL, listener roles, non-root warning, payload fix incorporated
+**Status:** ✅ Updated — v0.4.0 profile system (role-based traffic profiles, host assignments, tag groups) incorporated
 
 ---
 
@@ -1030,6 +1030,117 @@ This architecture provides a **secure, scalable, and maintainable** foundation f
 
 ---
 
-**Document Status:** ✅ Updated — v0.3.0 implemented and tested
+---
+
+## 14. Profile System (v0.4.0)
+
+### 14.1 Overview
+
+The profile system replaces the per-host repetition of traffic rules with
+reusable **role-based profiles** (`.profile` files).  Instead of writing
+individual rules for every host, an operator:
+
+1. Defines profiles for each host role (e.g. `domain_controller`, `windows_client`).
+2. Tags target hosts in the config (`#tag:dc`, `#tag:client`).
+3. Assigns profiles to hosts in the `[ASSIGNMENTS]` section.
+
+The master resolves profiles to concrete rules at agent-registration time,
+substituting `SELF` and `group:<tag>` placeholders with real IP addresses.
+
+### 14.2 Profile File Format
+
+Profile files use the `.profile` extension and live in the directory configured
+by `PROFILE_DIR`.  Each file has two INI sections:
+
+```ini
+[META]
+NAME        = domain_controller
+DESCRIPTION = Windows AD Domain Controller
+VERSION     = 1.0
+EXTENDS     = base_windows          # optional single inheritance
+TAGS        = windows, active-directory
+
+[RULES]
+# PROTOCOL  ROLE     SRC   DST           PORT  INTERVAL  COUNT  #name
+TCP          connect  SELF  group:dc      389   15        3      #ldap-replication
+TCP          listen   SELF  -             389   -         -      #ldap-listener
+UDP          connect  SELF  ANY           53    15        2      #dns-query
+```
+
+**Rule columns:**
+
+| Column | Values | Notes |
+|--------|--------|-------|
+| `PROTOCOL` | `TCP` / `UDP` | |
+| `ROLE` | `connect` / `listen` | `connect` = dial out; `listen` = open port |
+| `SRC` | `SELF`, IP, target name | `SELF` = this agent's own IP |
+| `DST` | `SELF`, IP, target, `group:<tag>`, `ANY`, `-` | `-` = unused (listen rules) |
+| `PORT` | 1–65535 | |
+| `INTERVAL` | seconds or `-` | `-` = 0 (immediate) |
+| `COUNT` | number, `loop`, or `-` | `-` or `loop` = repeat forever |
+| `#name` | optional label | trailing inline comment |
+
+Whitespace between columns is not significant — one space or ten spaces, the
+parser treats them identically.
+
+### 14.3 Master Config with Profiles
+
+```ini
+[MASTER]
+PORT        = 9000
+PSK         = ChangeMe2026!
+TTL         = 300
+PROFILE_DIR = ./profiles        # directory containing *.profile files
+
+[TARGETS]
+DC1     = 10.0.0.1   #tag:dc
+DC2     = 10.0.0.2   #tag:dc
+CLIENT1 = 10.0.0.10  #tag:client
+WEB1    = 10.0.0.20  #tag:web
+
+[ASSIGNMENTS]
+DC1     = domain_controller
+DC2     = domain_controller
+CLIENT1 = windows_client
+WEB1    = web_server
+```
+
+**How tags work:** `#tag:dc` annotations on target lines cause the master to
+build a `tagMap` (`dc → [10.0.0.1, 10.0.0.2]`).  Profile rules that reference
+`group:dc` are expanded to one concrete rule per IP in that tag group.
+
+### 14.4 Rule Resolution Algorithm
+
+When an agent with IP `10.0.0.10` registers and is assigned profile
+`windows_client`:
+
+```
+1. Flatten profile chain: windows_client → base_windows (EXTENDS) + own rules
+2. For each ProfileRule:
+   a. ROLE = "listen"  → emit TrafficRule{Role:listen, Port:…}
+   b. ROLE = "connect" →
+      - Resolve SRC: SELF → 10.0.0.10
+      - Skip if resolved SRC ≠ agent IP (rule belongs to another host)
+      - Resolve DST:
+          group:dc  → [10.0.0.1, 10.0.0.2]
+          ANY       → all IPs in TargetMap
+          SELF      → 10.0.0.10
+          <name>    → TargetMap lookup
+          <bare IP> → as-is
+      - Emit one TrafficRule per resolved destination
+```
+
+### 14.5 Backward Compatibility
+
+The profile system is **fully additive**.  Existing configs with direct traffic
+rules (`[RULES]` sections) continue to work unchanged.  Profile-based and
+direct rules are applied in order — a config can use both simultaneously.
+
+If `PROFILE_DIR` is not set, or no `[ASSIGNMENTS]` are defined, the master
+falls back to the v0.3.0 direct-rule distribution logic.
+
+---
+
+**Document Status:** ✅ Updated — v0.4.0 implemented and tested
 **Last updated:** 2026-03-13
-**Changes in v0.3.0:** Standalone mode (instructions.conf + TTL), rule roles (connect/listen), port listener manager, non-root warning, random payload fix, smart rule distribution by agent IP
+**Changes in v0.4.0:** Profile system — `.profile` files, host tagging, `[ASSIGNMENTS]`, SELF/group/ANY placeholders, EXTENDS inheritance, backward-compatible with v0.3.x direct rules

@@ -59,7 +59,13 @@ type MasterConfig struct {
 	TTL          int               // Seconds agents should cache instructions (0 = no expiry)
 	ConfigPath   string
 	TrafficRules []*TrafficRule    // Loaded from config file
-	TargetMap    map[string]string // name -> IP mapping (for SOURCE/DEST routing)
+	TargetMap    map[string]string // name → IP mapping (for SOURCE/DEST routing)
+
+	// v0.4.0: Profile system
+	ProfileDir  string              // Directory containing .profile files (PROFILE_DIR key)
+	Assignments map[string][]string // host/IP or target name → []profile names ([ASSIGNMENTS])
+	TagMap      map[string][]string // tag name → []IP addresses (from #tag: annotations)
+	Profiles    map[string]*Profile // loaded profiles (populated after config parse)
 }
 
 // AgentConfig holds configuration for the agent mode.

@@ -75,18 +75,37 @@ func (ms *MasterServer) onTrafficRequest(agentID string, rules []*comm.TrafficRu
 }
 
 // loadConfig re-parses the configuration file from disk and updates the active rule set.
+// If PROFILE_DIR is set in the config, all *.profile files are also (re)loaded.
 func (ms *MasterServer) loadConfig() error {
 	freshCfg, err := config.ParseExtendedConfigV2(ms.configPath)
 	if err != nil {
 		return fmt.Errorf("failed to parse config file %q: %w", ms.configPath, err)
 	}
 
+	// Load profiles when PROFILE_DIR is configured.
+	if freshCfg.ProfileDir != "" {
+		profiles, err := config.LoadProfileDir(freshCfg.ProfileDir)
+		if err != nil {
+			ms.logger.Warn(fmt.Sprintf("Could not load profiles from %q: %v", freshCfg.ProfileDir, err))
+		} else {
+			freshCfg.Profiles = profiles
+			ms.logger.Info(fmt.Sprintf("Loaded %d profile(s) from %s", len(profiles), freshCfg.ProfileDir))
+		}
+	}
+
 	ms.ruleMu.Lock()
 	ms.rules = freshCfg.TrafficRules
 	ms.cfg.TTL = freshCfg.TTL
+	ms.cfg.TargetMap = freshCfg.TargetMap
+	ms.cfg.Assignments = freshCfg.Assignments
+	ms.cfg.TagMap = freshCfg.TagMap
+	ms.cfg.Profiles = freshCfg.Profiles
+	ms.cfg.ProfileDir = freshCfg.ProfileDir
 	ms.ruleMu.Unlock()
 
-	ms.logger.Info(fmt.Sprintf("Loaded %d traffic rules from %s (TTL=%ds)", len(freshCfg.TrafficRules), ms.configPath, freshCfg.TTL))
+	ms.logger.Info(fmt.Sprintf("Loaded %d traffic rule(s) from %s (TTL=%ds, profiles=%d, assignments=%d)",
+		len(freshCfg.TrafficRules), ms.configPath, freshCfg.TTL,
+		len(freshCfg.Profiles), len(freshCfg.Assignments)))
 	return nil
 }
 
@@ -136,12 +155,18 @@ func (ms *MasterServer) notifyAllAgents() {
 
 // distributeRulesToAgent builds a per-agent rule set and sends a CONFIG_UPDATE.
 //
-// Distribution logic (v0.3.0):
-//   - Rules with Source=="" (simple format): sent to ALL agents with Role="connect".
-//   - Rules with Source!="" (extended format):
-//     · If agent IP matches Source → sent with Role="connect".
-//     · If agent IP matches Target(Dest) → sent with Role="listen".
-//     · Otherwise the rule is not sent to that agent.
+// Distribution logic (v0.4.0):
+//
+//  1. Profile-based (preferred, v0.4.0+):
+//     If the agent IP has entries in [ASSIGNMENTS] and profiles are loaded,
+//     rules are resolved from the assigned profiles (SELF/group:/ANY expanded).
+//
+//  2. Direct rule fallback (v0.3.0 / legacy):
+//     Rules with Source=="" → sent to ALL agents (connect).
+//     Rules with Source!="" → sent to the matching source agent (connect) or
+//     the matching destination agent (listen).
+//
+// Both paths are additive: a config can mix profile assignments and direct rules.
 func (ms *MasterServer) distributeRulesToAgent(agentID string) {
 	agentIPs := ms.server.GetAgentIPs()
 	agentIP := agentIPs[agentID]
@@ -149,10 +174,41 @@ func (ms *MasterServer) distributeRulesToAgent(agentID string) {
 	ms.ruleMu.RLock()
 	allRules := ms.rules
 	ttl := ms.cfg.TTL
+	assignments := ms.cfg.Assignments
+	tagMap := ms.cfg.TagMap
+	targetMap := ms.cfg.TargetMap
+	profiles := ms.cfg.Profiles
 	ms.ruleMu.RUnlock()
 
 	var agentRules []*comm.TrafficRule
 
+	// ── Profile-based distribution (v0.4.0) ──────────────────────────────────
+	if len(profiles) > 0 && len(assignments) > 0 && agentIP != "" {
+		profileNames := config.LookupAssignments(agentIP, assignments, targetMap)
+		if len(profileNames) > 0 {
+			resolved, err := config.ResolveProfileRules(profiles, profileNames, agentIP, targetMap, tagMap)
+			if err != nil {
+				ms.logger.Error(fmt.Sprintf("Profile resolution failed for agent %s (IP=%s): %v", agentID, agentIP, err))
+			} else {
+				for _, r := range resolved {
+					agentRules = append(agentRules, &comm.TrafficRule{
+						Protocol: r.Protocol,
+						Role:     r.Role,
+						Source:   r.Source,
+						Target:   r.Target,
+						Port:     r.Port,
+						Interval: r.Interval,
+						Count:    r.Count,
+						Name:     r.Name,
+					})
+				}
+				ms.logger.Info(fmt.Sprintf("Agent %s (IP=%s): %d rule(s) from profile(s) %v",
+					agentID, agentIP, len(agentRules), profileNames))
+			}
+		}
+	}
+
+	// ── Direct rule distribution (legacy / additive fallback) ─────────────────
 	for _, rule := range allRules {
 		if rule.Source == "" {
 			// Simple format — every agent acts as traffic generator.
@@ -207,7 +263,7 @@ func (ms *MasterServer) distributeRulesToAgent(agentID string) {
 	if err := ms.server.SendToAgent(agentID, msg); err != nil {
 		ms.logger.Error(fmt.Sprintf("Failed to send config to agent %s: %v", agentID, err))
 	} else {
-		ms.logger.Info(fmt.Sprintf("Sent %d rules to agent %s (TTL=%ds)", len(agentRules), agentID, ttl))
+		ms.logger.Info(fmt.Sprintf("Sent %d rule(s) to agent %s (TTL=%ds)", len(agentRules), agentID, ttl))
 	}
 }
 

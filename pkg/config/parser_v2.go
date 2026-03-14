@@ -34,10 +34,13 @@ func ParseExtendedConfigV2(filePath string) (*MasterConfig, error) {
 		Port:         defaultPort,
 		PSK:          psk,
 		TargetMap:    make(map[string]string),
+		Assignments:  make(map[string][]string),
+		TagMap:       make(map[string][]string),
 	}
 
 	scanner := bufio.NewScanner(file)
 	lineNum := 0
+	currentSection := "" // tracks the active [SECTION] header
 
 	for scanner.Scan() {
 		lineNum++
@@ -48,19 +51,35 @@ func ParseExtendedConfigV2(filePath string) (*MasterConfig, error) {
 			continue
 		}
 
-		// Skip INI section headers [MASTER], [AGENT]
+		// INI section headers — track active section, do not skip
 		if len(line) >= 2 && line[0] == '[' && line[len(line)-1] == ']' {
+			currentSection = strings.ToUpper(line[1 : len(line)-1])
 			continue
 		}
 
-		// Check for key=value format (INI-style or target definitions)
+		// Check for key=value format (INI-style or target/assignment definitions)
 		if idx := strings.Index(line, "="); idx != -1 {
 			key := strings.TrimSpace(strings.ToUpper(line[:idx]))
 			value := strings.TrimSpace(line[idx+1:])
 
-			// Strip inline comments from value
+			// Strip inline comments from value (but keep the raw line for tag extraction)
 			if cidx := strings.Index(value, "#"); cidx != -1 {
 				value = strings.TrimSpace(value[:cidx])
+			}
+
+			// [ASSIGNMENTS] section: key=hostname/IP, value=comma-separated profile names
+			if currentSection == "ASSIGNMENTS" {
+				assignKey := strings.TrimSpace(line[:idx])
+				if assignKey != "" {
+					var profileNames []string
+					for _, pn := range strings.Split(value, ",") {
+						if pn = strings.TrimSpace(pn); pn != "" {
+							profileNames = append(profileNames, pn)
+						}
+					}
+					config.Assignments[assignKey] = profileNames
+				}
+				continue
 			}
 
 			switch key {
@@ -81,15 +100,32 @@ func ParseExtendedConfigV2(filePath string) (*MasterConfig, error) {
 				}
 				config.TTL = ttl
 
+			case "PROFILE_DIR":
+				config.ProfileDir = value
+
 			case "CONFIG":
 				// Handled by CLI layer; ignore here.
 				continue
 
 			default:
-				// Assume it's a target definition (e.g. FILESERVER=10.0.0.1)
+				// Assume it's a target definition (e.g. DC1=10.0.0.1  #tag:dc)
 				targetName := strings.TrimSpace(line[:idx])
 				if len(targetName) > 0 && allAlphaNumeric(targetName) {
 					config.TargetMap[targetName] = value
+
+					// Extract #tag: annotations from the raw line comment
+					if hashIdx := strings.Index(line, "#"); hashIdx != -1 {
+						comment := line[hashIdx+1:]
+						for _, part := range strings.Fields(comment) {
+							part = strings.ToLower(strings.Trim(part, ","))
+							if strings.HasPrefix(part, "tag:") {
+								tag := part[4:]
+								if tag != "" {
+									config.TagMap[tag] = append(config.TagMap[tag], value)
+								}
+							}
+						}
+					}
 				}
 			}
 
@@ -101,10 +137,11 @@ func ParseExtendedConfigV2(filePath string) (*MasterConfig, error) {
 		//   Simple:   PROTOCOL  TARGET              PORT  INTERVAL  COUNT [#name]
 		//   Extended: PROTOCOL  SOURCE   DEST        PORT  COUNT    [#name]
 		//
-		// Distinguish by field count: simple has 5+ fields with an INTERVAL column;
-		// extended has 5+ fields but the 4th field is a port (no interval).
-		// We detect the format heuristically: if parts[3] looks like a port number
-		// and parts[4] is count/loop, it's extended; otherwise simple.
+		// [ASSIGNMENTS] lines without "=" are silently skipped (they belong to
+		// the assignments section, not the traffic rule section).
+		if currentSection == "ASSIGNMENTS" {
+			continue
+		}
 
 		parts := strings.Fields(line)
 		if len(parts) < 5 {
