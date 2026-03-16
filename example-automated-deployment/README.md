@@ -149,15 +149,27 @@ The script will:
 ### 5 — Verify
 
 ```bash
-# From your local machine
+# SSH to the jumphost and check agent status from there
+# (port 9001 is restricted to the private subnet — not reachable from the internet)
 MASTER_IP=$(cd ~/azure_lab_env && terraform output -raw jumphost_public_ip)
-curl http://${MASTER_IP}:9001/agents | jq .
 
-# Or SSH to the jumphost
+ssh azureuser@${MASTER_IP} '/usr/local/bin/trafficorch --status'
+ssh azureuser@${MASTER_IP} 'curl -s http://localhost:9001/agents | python3 -m json.tool'
+
+# Or open an interactive session and tail the master log
 ssh azureuser@${MASTER_IP}
-  /usr/local/bin/trafficorch --status
-  journalctl -u trafficorch-master -f
+# then:
+#   journalctl -u trafficorch-master -f
 ```
+
+> **Note:** Port 9001 is opened by the NSG rule only for inbound traffic from the
+> private subnet. To access the `/agents` JSON endpoint from your local machine,
+> route through an SSH tunnel:
+> ```bash
+> ssh -L 9001:localhost:9001 azureuser@${MASTER_IP}
+> # in another terminal:
+> curl http://localhost:9001/agents | jq .
+> ```
 
 ---
 
@@ -269,8 +281,12 @@ generated PSK.
 **Linux agent setup** (`trafficorch-agents-linux.yml`):
 - Downloads the binary from the master's HTTP server on port 9001
 - Verifies the SHA-256 checksum
-- Creates `/opt/trafficorch/trafficorch.env` with the PSK (mode 0600)
-- Installs and starts the `trafficorch-agent` systemd service
+- Creates `/opt/trafficorch/trafficorch.env` (mode 0600) with `TRAFFICORCH_MASTER`,
+  `TRAFFICORCH_PORT`, `TRAFFICORCH_PSK`, `TRAFFICORCH_ID` (`inventory_hostname`), and
+  `TRAFFICORCH_LOG_DIR` — the `--id` flag ensures each agent is registered with its
+  hostname in the master's agent registry
+- Installs and starts the `trafficorch-agent` systemd service with
+  `--agent --master ... --port ... --psk ... --id ...` sourced from the env file
 - Runs at `serial: 5` to avoid hammering port 9001
 
 **Windows agent setup** (`trafficorch-agents-windows.yml`):
@@ -278,7 +294,8 @@ generated PSK.
 - Downloads the binary from the master using `win_get_url`
 - Verifies the SHA-256 checksum via `win_stat`
 - Registers the agent as a **Windows Scheduled Task** (runs at boot as SYSTEM,
-  restarts up to 10 times on failure — no NSSM required)
+  restarts up to 10 times on failure — no NSSM required) with
+  `--agent --master ... --port ... --psk ... --id {{ inventory_hostname }}`
 - All PSK-handling tasks use `no_log: true`
 
 ### Self-update
@@ -307,7 +324,8 @@ rolling self-update across all connected agents.
   binary to anyone who can reach the jumphost on that port. The NSG rule limits access
   to the private subnet only.
 - The `group_vars/all.yml` file (written by `deploy.sh`) contains the PSK in plain
-  text. It is mode `0600`, listed in `.gitignore`, and must never be committed.
+  text. It is mode `0600` and covered by the `.gitignore` in this directory.
+  Never commit it — regenerate it by re-running `deploy.sh`.
 
 ---
 

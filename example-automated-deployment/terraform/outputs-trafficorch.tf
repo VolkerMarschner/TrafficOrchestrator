@@ -31,6 +31,6 @@ output "windows_workload_ips" {
 }
 
 output "trafficorch_status_url" {
-  description = "URL to query the agent registry (JSON) from outside the lab."
+  description = "URL to query the agent registry (JSON). Port 9001 is NSG-restricted to the private subnet — access via SSH tunnel or from the jumphost itself."
   value       = "http://${azurerm_public_ip.jumphost.ip_address}:9001/agents"
 }
