@@ -291,7 +291,7 @@ The master automatically serves its own binary over HTTP on **port 9001** — no
 # On a fresh host with no binary yet
 curl -O http://<master-ip>:9001/binary
 chmod +x binary
-./binary --agent --master <master-ip> --port 9000 --psk <key>
+./binary --agent --master <master-ip> --port 9000 --psk <key> --id <agent-id>
 ```
 
 | HTTP endpoint | Description |
