@@ -29,7 +29,10 @@ type MasterServer struct {
 	rules       []*config.TrafficRule
 	ruleMu      sync.RWMutex
 	fileWatcher chan struct{}
-	logger      *logging.Logger
+
+	// v0.4.6: split logging
+	slog *logging.Logger // master-status.log  — start/stop, agent events, config changes
+	tlog *logging.Logger // master-traffic.log — rule distribution, per-agent rule counts
 
 	// v0.4.5 additions
 	reg            *registry.Registry
@@ -40,7 +43,8 @@ type MasterServer struct {
 }
 
 // NewMasterServer creates a new master server instance.
-func NewMasterServer(cfg *config.MasterConfig, logger *logging.Logger) (*MasterServer, error) {
+// tlog receives traffic/rule-distribution events; slog receives operational status events.
+func NewMasterServer(cfg *config.MasterConfig, tlog, slog *logging.Logger) (*MasterServer, error) {
 	// ── Agent registry ────────────────────────────────────────────────────────
 	reg, err := registry.New(registryFile)
 	if err != nil {
@@ -51,7 +55,8 @@ func NewMasterServer(cfg *config.MasterConfig, logger *logging.Logger) (*MasterS
 		configPath:  cfg.ConfigPath,
 		cfg:         cfg,
 		fileWatcher: make(chan struct{}, 1),
-		logger:      logger,
+		slog:        slog,
+		tlog:        tlog,
 		reg:         reg,
 	}
 
@@ -76,13 +81,13 @@ func NewMasterServer(cfg *config.MasterConfig, logger *logging.Logger) (*MasterS
 
 	// Start the binary distribution HTTP server.
 	if err := ms.startDistributionServer(); err != nil {
-		logger.Warn(fmt.Sprintf("Distribution server unavailable: %v", err))
+		ms.slog.Warn(fmt.Sprintf("Distribution server unavailable: %v", err))
 	}
 
 	// Start file watcher for automatic config reload.
 	go ms.watchConfigFile()
 
-	ms.logger.Info(fmt.Sprintf("Master server initialised on port %d (TTL=%ds)", cfg.Port, cfg.TTL))
+	ms.slog.Info(fmt.Sprintf("Master server initialised on port %d (TTL=%ds)", cfg.Port, cfg.TTL))
 	return ms, nil
 }
 
@@ -95,8 +100,8 @@ func (ms *MasterServer) onAgentRegister(agentID string, hostname string) {
 	agentVer := ms.server.GetAgentVersion(agentID)
 	agentPlatform := ms.server.GetAgentPlatform(agentID)
 
-	ms.logger.Info(fmt.Sprintf("New agent registered: %s (%s) v%s @ %s",
-		agentID, hostname, agentVer, agentIP))
+	ms.slog.Info(fmt.Sprintf("Agent registered: %s (%s) v%s @ %s [%s]",
+		agentID, hostname, agentVer, agentIP, agentPlatform))
 
 	// Upsert into persistent registry.
 	ms.reg.Upsert(registry.AgentRecord{
@@ -116,7 +121,7 @@ func (ms *MasterServer) onAgentRegister(agentID string, hostname string) {
 
 // onTrafficRequest handles traffic generation requests from agents.
 func (ms *MasterServer) onTrafficRequest(agentID string, rules []*comm.TrafficRule) {
-	ms.logger.Info(fmt.Sprintf("Traffic request from %s: %d rules", agentID, len(rules)))
+	ms.tlog.Info(fmt.Sprintf("Traffic request from %s: %d rules", agentID, len(rules)))
 }
 
 // onAgentHeartbeat is called on every agent heartbeat.
@@ -133,7 +138,7 @@ func (ms *MasterServer) onAgentHeartbeat(agentID string, hb comm.HeartbeatMessag
 
 // onAgentDisconnect is called when an agent disconnects.
 func (ms *MasterServer) onAgentDisconnect(agentID string) {
-	ms.logger.Info(fmt.Sprintf("Agent %s disconnected", agentID))
+	ms.slog.Info(fmt.Sprintf("Agent %s disconnected", agentID))
 	ms.reg.SetOffline(agentID)
 	ms.updateNotified.Delete(agentID) // allow re-notification on next connect
 }
@@ -156,9 +161,9 @@ func (ms *MasterServer) sendUpdateNotification(agentID string) {
 		SHA256:     ms.binarySHA,
 	}
 	if err := ms.server.SendToAgent(agentID, msg); err != nil {
-		ms.logger.Warn(fmt.Sprintf("Failed to send UPDATE_AVAILABLE to %s: %v", agentID, err))
+		ms.slog.Warn(fmt.Sprintf("Failed to send UPDATE_AVAILABLE to %s: %v", agentID, err))
 	} else {
-		ms.logger.Info(fmt.Sprintf("Sent UPDATE_AVAILABLE to agent %s (new: v%s)", agentID, version))
+		ms.slog.Info(fmt.Sprintf("Sent UPDATE_AVAILABLE to agent %s (new: v%s)", agentID, version))
 	}
 }
 
@@ -192,10 +197,10 @@ func (ms *MasterServer) startDistributionServer() error {
 	}
 
 	go func() {
-		ms.logger.Info(fmt.Sprintf("Distribution server listening on port %d (SHA256: %s...)",
+		ms.slog.Info(fmt.Sprintf("Distribution server listening on port %d (SHA256: %s...)",
 			distributionPort, ms.binarySHA[:16]))
 		if err := ms.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			ms.logger.Error(fmt.Sprintf("Distribution server error: %v", err))
+			ms.slog.Error(fmt.Sprintf("Distribution server error: %v", err))
 		}
 	}()
 
@@ -240,7 +245,7 @@ func (ms *MasterServer) handleAgents(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	records := ms.reg.All()
 	if err := json.NewEncoder(w).Encode(records); err != nil {
-		ms.logger.Warn(fmt.Sprintf("Failed to encode agents response: %v", err))
+		ms.slog.Warn(fmt.Sprintf("Failed to encode agents response: %v", err))
 	}
 }
 
@@ -254,13 +259,14 @@ func (ms *MasterServer) loadConfig() error {
 	}
 
 	// Load profiles when PROFILE_DIR is configured.
+	// PROFILE_DIR is already resolved to an absolute path by ParseExtendedConfigV2.
 	if freshCfg.ProfileDir != "" {
 		profiles, err := config.LoadProfileDir(freshCfg.ProfileDir)
 		if err != nil {
-			ms.logger.Warn(fmt.Sprintf("Could not load profiles from %q: %v", freshCfg.ProfileDir, err))
+			ms.slog.Warn(fmt.Sprintf("Could not load profiles from %q: %v", freshCfg.ProfileDir, err))
 		} else {
 			freshCfg.Profiles = profiles
-			ms.logger.Info(fmt.Sprintf("Loaded %d profile(s) from %s", len(profiles), freshCfg.ProfileDir))
+			ms.slog.Info(fmt.Sprintf("Loaded %d profile(s) from %s", len(profiles), freshCfg.ProfileDir))
 		}
 	}
 
@@ -274,9 +280,9 @@ func (ms *MasterServer) loadConfig() error {
 	ms.cfg.ProfileDir = freshCfg.ProfileDir
 	ms.ruleMu.Unlock()
 
-	ms.logger.Info(fmt.Sprintf("Loaded %d traffic rule(s) from %s (TTL=%ds, profiles=%d, assignments=%d)",
-		len(freshCfg.TrafficRules), ms.configPath, freshCfg.TTL,
-		len(freshCfg.Profiles), len(freshCfg.Assignments)))
+	ms.slog.Info(fmt.Sprintf("Config loaded: %s — %d direct rule(s), %d profile(s), %d assignment(s), TTL=%ds",
+		ms.configPath, len(freshCfg.TrafficRules), len(freshCfg.Profiles),
+		len(freshCfg.Assignments), freshCfg.TTL))
 	return nil
 }
 
@@ -289,18 +295,18 @@ func (ms *MasterServer) watchConfigFile() {
 		case <-time.After(configWatchInterval):
 			info, err := os.Stat(ms.configPath)
 			if err != nil {
-				ms.logger.Error(fmt.Sprintf("Config file not found: %s", ms.configPath))
+				ms.slog.Error(fmt.Sprintf("Config file not found: %s", ms.configPath))
 				continue
 			}
 			modTime := info.ModTime()
 			if !modTime.Equal(lastModTime) && !lastModTime.IsZero() {
-				ms.logger.Info("Config file changed, reloading...")
+				ms.slog.Info("Config file changed — reloading...")
 				go ms.loadConfigAndNotify()
 			}
 			lastModTime = modTime
 
 		case <-ms.fileWatcher:
-			ms.logger.Info("Config reload triggered manually")
+			ms.slog.Info("Config reload triggered manually")
 			go ms.loadConfigAndNotify()
 		}
 	}
@@ -309,7 +315,7 @@ func (ms *MasterServer) watchConfigFile() {
 // loadConfigAndNotify reloads config and pushes updates to all agents.
 func (ms *MasterServer) loadConfigAndNotify() {
 	if err := ms.loadConfig(); err != nil {
-		ms.logger.Error(fmt.Sprintf("Failed to reload config: %v", err))
+		ms.slog.Error(fmt.Sprintf("Failed to reload config: %v", err))
 		return
 	}
 	ms.notifyAllAgents()
@@ -360,7 +366,7 @@ func (ms *MasterServer) distributeRulesToAgent(agentID string) {
 		if len(profileNames) > 0 {
 			resolved, err := config.ResolveProfileRules(profiles, profileNames, agentIP, targetMap, tagMap)
 			if err != nil {
-				ms.logger.Error(fmt.Sprintf("Profile resolution failed for agent %s (IP=%s): %v", agentID, agentIP, err))
+				ms.tlog.Error(fmt.Sprintf("Profile resolution failed for agent %s (IP=%s): %v", agentID, agentIP, err))
 			} else {
 				for _, r := range resolved {
 					agentRules = append(agentRules, &comm.TrafficRule{
@@ -374,9 +380,11 @@ func (ms *MasterServer) distributeRulesToAgent(agentID string) {
 						Name:     r.Name,
 					})
 				}
-				ms.logger.Info(fmt.Sprintf("Agent %s (IP=%s): %d rule(s) from profile(s) %v",
+				ms.tlog.Info(fmt.Sprintf("Agent %s (IP=%s): %d rule(s) from profile(s) %v",
 					agentID, agentIP, len(agentRules), profileNames))
 			}
+		} else {
+			ms.tlog.Info(fmt.Sprintf("Agent %s (IP=%s): no profile assignment found", agentID, agentIP))
 		}
 	}
 
@@ -415,7 +423,7 @@ func (ms *MasterServer) distributeRulesToAgent(agentID string) {
 	}
 
 	if len(agentRules) == 0 {
-		ms.logger.Debug(fmt.Sprintf("No rules applicable to agent %s (IP=%s)", agentID, agentIP))
+		ms.tlog.Debug(fmt.Sprintf("No rules applicable to agent %s (IP=%s)", agentID, agentIP))
 		return
 	}
 
@@ -430,9 +438,9 @@ func (ms *MasterServer) distributeRulesToAgent(agentID string) {
 	}
 
 	if err := ms.server.SendToAgent(agentID, msg); err != nil {
-		ms.logger.Error(fmt.Sprintf("Failed to send config to agent %s: %v", agentID, err))
+		ms.tlog.Error(fmt.Sprintf("Failed to send config to agent %s: %v", agentID, err))
 	} else {
-		ms.logger.Info(fmt.Sprintf("Sent %d rule(s) to agent %s (TTL=%ds)", len(agentRules), agentID, ttl))
+		ms.tlog.Info(fmt.Sprintf("Sent %d rule(s) to agent %s (TTL=%ds)", len(agentRules), agentID, ttl))
 	}
 }
 
@@ -440,17 +448,17 @@ func (ms *MasterServer) distributeRulesToAgent(agentID string) {
 
 // Start starts the master server and blocks until a shutdown signal is received.
 func (ms *MasterServer) Start() error {
-	ms.logger.Info(fmt.Sprintf("Starting Traffic Orchestrator Master v%s", version))
-	ms.logger.Info(fmt.Sprintf("Listening on port %d with PSK authentication", ms.cfg.Port))
-	ms.logger.Info(fmt.Sprintf("Config file: %s (%d rules loaded)", ms.configPath, len(ms.rules)))
+	ms.slog.Info(fmt.Sprintf("Starting Traffic Orchestrator Master v%s", version))
+	ms.slog.Info(fmt.Sprintf("Listening on port %d with PSK authentication", ms.cfg.Port))
+	ms.slog.Info(fmt.Sprintf("Config file: %s", ms.configPath))
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	<-sigChan
-	ms.logger.Info("Shutdown signal received")
+	ms.slog.Info("Shutdown signal received")
 
-	return ms.Stop(ms.logger)
+	return ms.Stop(ms.slog)
 }
 
 // Stop gracefully shuts down the master server and the HTTP distribution server.

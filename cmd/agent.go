@@ -42,13 +42,17 @@ type Agent struct {
 	isRunning    int32 // accessed via sync/atomic
 	stopChan     chan struct{}
 	listenerMgr  *traffic.ListenerManager
-	logger       *logging.Logger
+
+	// v0.4.6: split logging
+	slog *logging.Logger // agent-status.log  — start/stop, connect, update events
+	tlog *logging.Logger // agent-traffic.log — rule application, connections, listeners
 }
 
 // NewAgent creates and registers a connected agent.
+// tlog receives traffic events; slog receives operational status events.
 // If the master is unreachable it returns an error; the caller may then try
 // newStandaloneAgent instead.
-func NewAgent(cfg *config.AgentConfig, logger *logging.Logger) (*Agent, error) {
+func NewAgent(cfg *config.AgentConfig, tlog, slog *logging.Logger) (*Agent, error) {
 	client, err := comm.NewAgentClient(cfg.MasterHost, cfg.Port, cfg.PSK)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to master: %w", err)
@@ -57,7 +61,7 @@ func NewAgent(cfg *config.AgentConfig, logger *logging.Logger) (*Agent, error) {
 	hostname, _ := os.Hostname()
 	platform := fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)
 
-	logger.Info(fmt.Sprintf("Agent connecting to master at %s:%d", cfg.MasterHost, cfg.Port))
+	slog.Info(fmt.Sprintf("Connecting to master at %s:%d", cfg.MasterHost, cfg.Port))
 	if err := client.Register(cfg.AgentID, hostname, platform, version); err != nil {
 		client.Close()
 		return nil, fmt.Errorf("failed to register with master: %w", err)
@@ -70,26 +74,27 @@ func NewAgent(cfg *config.AgentConfig, logger *logging.Logger) (*Agent, error) {
 		masterCfg:   masterConnInfo{cfg.MasterHost, cfg.Port, cfg.PSK},
 		stopChan:    make(chan struct{}),
 		listenerMgr: traffic.NewListenerManager(),
-		logger:      logger,
+		slog:        slog,
+		tlog:        tlog,
 	}, nil
 }
 
 // newStandaloneAgent creates an agent that operates from a local instructions.conf.
 // If instrPath does not exist, an error is returned.
-func newStandaloneAgent(instrPath string, fallbackCfg masterConnInfo, agentID string, logger *logging.Logger) (*Agent, error) {
+func newStandaloneAgent(instrPath string, fallbackCfg masterConnInfo, agentID string, tlog, slog *logging.Logger) (*Agent, error) {
 	instrConf, err := config.LoadInstructionsConf(instrPath)
 	if err != nil {
 		return nil, fmt.Errorf("no instructions.conf found (%s): %w", instrPath, err)
 	}
 
-	logger.Info(fmt.Sprintf("Standalone mode: loaded %d rules from %s (received %s)",
+	slog.Info(fmt.Sprintf("Standalone mode: loaded %d rules from %s (received %s)",
 		len(instrConf.Rules), instrPath, instrConf.ReceivedAt.Format(time.RFC3339)))
 
 	if instrConf.TTL > 0 {
 		if instrConf.IsExpired() {
-			logger.Warn("instructions.conf TTL has already expired — will attempt to reconnect to master")
+			slog.Warn("instructions.conf TTL has already expired — will attempt to reconnect to master")
 		} else {
-			logger.Info(fmt.Sprintf("Instructions valid for another %s (TTL %ds)",
+			slog.Info(fmt.Sprintf("Instructions valid for another %s (TTL %ds)",
 				instrConf.ExpiresIn().Round(time.Second), instrConf.TTL))
 		}
 	}
@@ -120,7 +125,8 @@ func newStandaloneAgent(instrPath string, fallbackCfg masterConnInfo, agentID st
 		currentRules: instrConf.Rules,
 		stopChan:     make(chan struct{}),
 		listenerMgr:  traffic.NewListenerManager(),
-		logger:       logger,
+		slog:         slog,
+		tlog:         tlog,
 	}
 
 	// Schedule TTL-based reconnect if appropriate.
@@ -131,11 +137,9 @@ func newStandaloneAgent(instrPath string, fallbackCfg masterConnInfo, agentID st
 	return a, nil
 }
 
-// ─── Startup ─────────────────────────────────────────────────────────────────
-
-// Start begins the agent's main loop and blocks until shutdown.
+// Start begins the agent main loop and blocks until shutdown.
 func (a *Agent) Start() error {
-	a.logger.Info(fmt.Sprintf("Agent %s started (standalone=%v)", a.agentID, a.standalone))
+	a.slog.Info(fmt.Sprintf("Agent %s started (standalone=%v)", a.agentID, a.standalone))
 	atomic.StoreInt32(&a.isRunning, 1)
 
 	if !a.standalone {
@@ -145,21 +149,18 @@ func (a *Agent) Start() error {
 		a.applyRules(a.currentRules)
 	}
 
-	// Wait for OS shutdown signal or internal stop.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	select {
 	case <-sigChan:
-		a.logger.Info("Shutdown signal received")
+		a.slog.Info("Shutdown signal received")
 	case <-a.stopChan:
-		a.logger.Info("Agent stopping")
+		a.slog.Info("Agent stopping")
 	}
 
 	return a.Stop()
 }
-
-// ─── Rule application ─────────────────────────────────────────────────────────
 
 // applyRules stops existing listeners, starts new ones for "listen" rules,
 // and launches goroutines for "connect" rules.
@@ -173,12 +174,12 @@ func (a *Agent) applyRules(rules []*config.TrafficRule) {
 	var connectRules []*comm.TrafficRule
 
 	for _, rule := range rules {
-		r := rule // capture
+		r := rule
 		if r.Role == "listen" {
 			if err := a.listenerMgr.StartListener(r.Protocol, r.Port); err != nil {
-				a.logger.Error(fmt.Sprintf("Failed to open %s listener on port %d: %v", r.Protocol, r.Port, err))
+				a.tlog.Error(fmt.Sprintf("Failed to open %s listener on port %d: %v", r.Protocol, r.Port, err))
 			} else {
-				a.logger.Info(fmt.Sprintf("Listening on %s port %d", r.Protocol, r.Port))
+				a.tlog.Info(fmt.Sprintf("Listening on %s port %d", r.Protocol, r.Port))
 			}
 		} else {
 			connectRules = append(connectRules, configRuleToComm(r))
@@ -190,7 +191,6 @@ func (a *Agent) applyRules(rules []*config.TrafficRule) {
 	}
 }
 
-// configRuleToComm converts a config.TrafficRule to a comm.TrafficRule.
 func configRuleToComm(r *config.TrafficRule) *comm.TrafficRule {
 	return &comm.TrafficRule{
 		Protocol: r.Protocol,
@@ -204,7 +204,6 @@ func configRuleToComm(r *config.TrafficRule) *comm.TrafficRule {
 	}
 }
 
-// commRulesToConfig converts a slice of comm.TrafficRule to config.TrafficRule.
 func commRulesToConfig(rules []*comm.TrafficRule) []*config.TrafficRule {
 	out := make([]*config.TrafficRule, len(rules))
 	for i, r := range rules {
@@ -222,8 +221,6 @@ func commRulesToConfig(rules []*comm.TrafficRule) []*config.TrafficRule {
 	return out
 }
 
-// ─── Connected-mode message loop ──────────────────────────────────────────────
-
 // receiveMessages continuously reads and handles messages from the master.
 func (a *Agent) receiveMessages() {
 	for {
@@ -233,7 +230,7 @@ func (a *Agent) receiveMessages() {
 
 		msg, msgBytes, err := a.client.ReadMessage()
 		if err != nil {
-			a.logger.Error(fmt.Sprintf("Error receiving message from master: %v", err))
+			a.slog.Error(fmt.Sprintf("Error receiving message from master: %v", err))
 			time.Sleep(reconnectDelay)
 			continue
 		}
@@ -242,7 +239,7 @@ func (a *Agent) receiveMessages() {
 		case comm.MsgConfigUpdate:
 			var configMsg comm.ConfigUpdateMessage
 			if err := json.Unmarshal(msgBytes, &configMsg); err == nil {
-				a.logger.Info(fmt.Sprintf("Received CONFIG_UPDATE: %d rules (TTL=%ds)", len(configMsg.Rules), configMsg.TTL))
+				a.tlog.Info(fmt.Sprintf("CONFIG_UPDATE received: %d rule(s) (TTL=%ds)", len(configMsg.Rules), configMsg.TTL))
 				cfgRules := commRulesToConfig(configMsg.Rules)
 				a.applyRules(cfgRules)
 				a.saveInstructions(configMsg.TTL, cfgRules)
@@ -260,29 +257,26 @@ func (a *Agent) receiveMessages() {
 		case comm.MsgUpdateAvailable:
 			var updateMsg comm.UpdateAvailableMessage
 			if err := json.Unmarshal(msgBytes, &updateMsg); err == nil {
-				a.logger.Info(fmt.Sprintf("Update available: v%s (current: v%s)", updateMsg.NewVersion, version))
+				a.slog.Info(fmt.Sprintf("Update available: v%s (current: v%s) — downloading...", updateMsg.NewVersion, version))
 				go a.applyUpdate(updateMsg)
 			}
 
 		default:
-			a.logger.Warn(fmt.Sprintf("Unknown message type: %s", msg.Type))
+			a.slog.Warn(fmt.Sprintf("Unknown message type: %s", msg.Type))
 		}
 	}
 }
 
-// applyUpdate downloads and installs a newer binary from the master's distribution
-// server, then re-executes the new binary (Linux/macOS) or triggers a helper script (Windows).
 func (a *Agent) applyUpdate(msg comm.UpdateAvailableMessage) {
 	exe, err := os.Executable()
 	if err != nil {
-		a.logger.Error(fmt.Sprintf("Self-update: cannot locate own binary: %v", err))
+		a.slog.Error(fmt.Sprintf("Self-update: cannot locate own binary: %v", err))
 		return
 	}
 
 	downloadURL := fmt.Sprintf("http://%s:%d/binary", a.masterCfg.host, msg.HTTPPort)
-	a.logger.Info(fmt.Sprintf("Self-update: downloading v%s from %s", msg.NewVersion, downloadURL))
+	a.slog.Info(fmt.Sprintf("Self-update: downloading v%s from %s", msg.NewVersion, downloadURL))
 
-	// Pass current args to the restarted process, minus the internal --daemon-child flag.
 	restartArgs := make([]string, 0, len(os.Args)-1)
 	for _, arg := range os.Args[1:] {
 		if arg != "--daemon-child" {
@@ -291,13 +285,11 @@ func (a *Agent) applyUpdate(msg comm.UpdateAvailableMessage) {
 	}
 
 	if err := update.Apply(downloadURL, msg.SHA256, exe, restartArgs); err != nil {
-		a.logger.Error(fmt.Sprintf("Self-update failed: %v", err))
+		a.slog.Error(fmt.Sprintf("Self-update failed: %v", err))
 		return
 	}
-	// On success, Apply never returns — it exec's the new binary or calls os.Exit.
 }
 
-// saveInstructions persists the received rules and connection info to instructions.conf.
 func (a *Agent) saveInstructions(ttl int, rules []*config.TrafficRule) {
 	instrConf := &config.InstructionsConf{
 		ReceivedAt: time.Now(),
@@ -309,13 +301,11 @@ func (a *Agent) saveInstructions(ttl int, rules []*config.TrafficRule) {
 		Rules:      rules,
 	}
 	if err := config.SaveInstructionsConf(config.InstructionsConfFile, instrConf); err != nil {
-		a.logger.Warn(fmt.Sprintf("Could not save instructions.conf: %v", err))
+		a.slog.Warn(fmt.Sprintf("Could not save instructions.conf: %v", err))
 	} else {
-		a.logger.Info("Instructions saved to instructions.conf")
+		a.slog.Info("Instructions saved to instructions.conf")
 	}
 }
-
-// ─── Traffic execution ────────────────────────────────────────────────────────
 
 func (a *Agent) startTraffic(rules []*comm.TrafficRule) {
 	if atomic.LoadInt32(&a.isRunning) != 0 {
@@ -324,12 +314,12 @@ func (a *Agent) startTraffic(rules []*comm.TrafficRule) {
 }
 
 func (a *Agent) executeTraffic(rules []*comm.TrafficRule) {
-	a.logger.Info(fmt.Sprintf("Starting traffic generation for %d rules", len(rules)))
+	a.tlog.Info(fmt.Sprintf("Starting traffic generation for %d rule(s)", len(rules)))
 
 	var wg sync.WaitGroup
 	for _, rule := range rules {
 		if rule.Role == "listen" {
-			continue // listeners are handled by applyRules
+			continue
 		}
 		wg.Add(1)
 		go func(r *comm.TrafficRule) {
@@ -339,14 +329,14 @@ func (a *Agent) executeTraffic(rules []*comm.TrafficRule) {
 	}
 
 	wg.Wait()
-	a.logger.Info(fmt.Sprintf("Traffic generation completed for %d rules", len(rules)))
+	a.tlog.Info(fmt.Sprintf("Traffic generation completed for %d rule(s)", len(rules)))
 }
 
 func (a *Agent) executeSingleRule(rule *comm.TrafficRule) {
 	address := net.JoinHostPort(rule.Target, strconv.Itoa(rule.Port))
 	connCount := 0
 
-	a.logger.Info(fmt.Sprintf("Starting rule: %s (%s → %s)", rule.Name, rule.Protocol, address))
+	a.tlog.Info(fmt.Sprintf("Rule start: %s (%s %s)", rule.Name, rule.Protocol, address))
 
 	for {
 		if atomic.LoadInt32(&a.isRunning) == 0 {
@@ -354,19 +344,18 @@ func (a *Agent) executeSingleRule(rule *comm.TrafficRule) {
 		}
 
 		var err error
-
 		switch rule.Protocol {
 		case "TCP":
 			err = a.dialTCP(address, rule.Name)
 		case "UDP":
 			err = a.dialUDP(address, rule.Name)
 		default:
-			a.logger.Error(fmt.Sprintf("Unsupported protocol: %s", rule.Protocol))
+			a.tlog.Error(fmt.Sprintf("Unsupported protocol: %s", rule.Protocol))
 			return
 		}
 
 		if err != nil {
-			a.logger.Warn(fmt.Sprintf("Connection failed to %s (%s): %v", address, rule.Protocol, err))
+			a.tlog.Warn(fmt.Sprintf("Connection failed %s %s (%s): %v", rule.Protocol, address, rule.Name, err))
 		} else {
 			connCount++
 		}
@@ -382,10 +371,9 @@ func (a *Agent) executeSingleRule(rule *comm.TrafficRule) {
 		}
 	}
 
-	a.logger.Info(fmt.Sprintf("Rule %s COMPLETED: %d connections generated", rule.Name, connCount))
+	a.tlog.Info(fmt.Sprintf("Rule complete: %s — %d connection(s)", rule.Name, connCount))
 }
 
-// dialTCP dials address, sends a random payload, then closes the connection.
 func (a *Agent) dialTCP(address, ruleName string) error {
 	conn, err := net.DialTimeout("tcp", address, connectTimeout)
 	if err != nil {
@@ -396,15 +384,14 @@ func (a *Agent) dialTCP(address, ruleName string) error {
 	payload := randomPayload(64)
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, werr := conn.Write(payload); werr != nil {
-		a.logger.Warn(fmt.Sprintf("TCP write error to %s: %v", address, werr))
+		a.tlog.Warn(fmt.Sprintf("TCP write error to %s: %v", address, werr))
 	}
 
 	time.Sleep(tcpHoldDuration)
-	a.logger.Info(fmt.Sprintf("TCP connection to %s (%s): %d bytes sent", address, ruleName, len(payload)))
+	a.tlog.Info(fmt.Sprintf("TCP %s (%s): %d bytes sent", address, ruleName, len(payload)))
 	return nil
 }
 
-// dialUDP sends a random payload UDP datagram to address.
 func (a *Agent) dialUDP(address, ruleName string) error {
 	conn, err := net.DialTimeout("udp", address, connectTimeout)
 	if err != nil {
@@ -418,17 +405,13 @@ func (a *Agent) dialUDP(address, ruleName string) error {
 		return fmt.Errorf("UDP send error: %w", werr)
 	}
 
-	a.logger.Info(fmt.Sprintf("UDP datagram to %s (%s): %d bytes sent", address, ruleName, len(payload)))
+	a.tlog.Info(fmt.Sprintf("UDP %s (%s): %d bytes sent", address, ruleName, len(payload)))
 	return nil
 }
 
-// stopTraffic signals traffic goroutines to stop (future: implement per-rule cancel).
 func (a *Agent) stopTraffic() {
-	a.logger.Info("Stopping traffic generation...")
-	// TODO: implement per-rule cancellation channels
+	a.tlog.Info("Stopping traffic generation...")
 }
-
-// ─── Heartbeat ────────────────────────────────────────────────────────────────
 
 func (a *Agent) sendHeartbeatLoop() {
 	ticker := time.NewTicker(heartbeatInterval)
@@ -448,7 +431,7 @@ func (a *Agent) sendHeartbeatLoop() {
 			a.mu.RUnlock()
 
 			if err := a.client.SendHeartbeat(version, cpuUsage, memUsage, activeRules); err != nil {
-				a.logger.Warn(fmt.Sprintf("Failed to send heartbeat: %v", err))
+				a.slog.Warn(fmt.Sprintf("Failed to send heartbeat: %v", err))
 			}
 
 		case <-a.stopChan:
@@ -458,17 +441,13 @@ func (a *Agent) sendHeartbeatLoop() {
 }
 
 func (a *Agent) getSystemStats() (float64, int64) {
-	return 0.0, 0 // TODO: implement real CPU/memory stats
+	return 0.0, 0
 }
 
-// ─── Standalone / TTL reconnect ───────────────────────────────────────────────
-
-// ttlReconnectLoop waits for the TTL to expire then tries to reconnect to master.
-// On successful reconnection the agent switches to connected mode.
 func (a *Agent) ttlReconnectLoop(instrConf *config.InstructionsConf) {
 	waitDuration := instrConf.ExpiresIn()
 	if waitDuration > 0 {
-		a.logger.Info(fmt.Sprintf("TTL reconnect scheduled in %s", waitDuration.Round(time.Second)))
+		a.slog.Info(fmt.Sprintf("TTL reconnect scheduled in %s", waitDuration.Round(time.Second)))
 		select {
 		case <-time.After(waitDuration):
 		case <-a.stopChan:
@@ -476,24 +455,22 @@ func (a *Agent) ttlReconnectLoop(instrConf *config.InstructionsConf) {
 		}
 	}
 
-	a.logger.Info("TTL expired — attempting to reconnect to master...")
+	a.slog.Info("TTL expired — attempting to reconnect to master...")
 	a.reconnectToMaster()
 }
 
-// reconnectToMaster attempts to establish a new master connection in a retry loop.
-// On success the agent switches to connected mode and starts normal operation.
 func (a *Agent) reconnectToMaster() {
 	for attempt := 1; ; attempt++ {
 		if atomic.LoadInt32(&a.isRunning) == 0 {
 			return
 		}
 
-		a.logger.Info(fmt.Sprintf("Reconnect attempt %d to %s:%d...",
+		a.slog.Info(fmt.Sprintf("Reconnect attempt %d to %s:%d...",
 			attempt, a.masterCfg.host, a.masterCfg.port))
 
 		client, err := comm.NewAgentClient(a.masterCfg.host, a.masterCfg.port, a.masterCfg.psk)
 		if err != nil {
-			a.logger.Warn(fmt.Sprintf("Reconnect attempt %d failed: %v — retrying in 30s", attempt, err))
+			a.slog.Warn(fmt.Sprintf("Reconnect attempt %d failed: %v — retrying in 30s", attempt, err))
 			select {
 			case <-time.After(30 * time.Second):
 				continue
@@ -507,7 +484,7 @@ func (a *Agent) reconnectToMaster() {
 
 		if err := client.Register(a.agentID, hostname, platform, version); err != nil {
 			client.Close()
-			a.logger.Warn(fmt.Sprintf("Reconnect registration failed: %v — retrying in 30s", err))
+			a.slog.Warn(fmt.Sprintf("Reconnect registration failed: %v — retrying in 30s", err))
 			select {
 			case <-time.After(30 * time.Second):
 				continue
@@ -516,7 +493,7 @@ func (a *Agent) reconnectToMaster() {
 			}
 		}
 
-		a.logger.Info("Reconnected to master — switching to connected mode")
+		a.slog.Info("Reconnected to master — switching to connected mode")
 
 		a.mu.Lock()
 		a.client = client
@@ -529,41 +506,39 @@ func (a *Agent) reconnectToMaster() {
 	}
 }
 
-// ─── Non-root warning ─────────────────────────────────────────────────────────
-
-// checkNonRootAndWarn prints a warning if the process is not running as root
-// on Linux/macOS, where ports ≤ 1024 require elevated privileges.
-// The warning is also sent to the master if a client connection is available.
-func checkNonRootAndWarn(agentID string, client *comm.AgentClient, logger *logging.Logger) {
-	// On Windows os.Getuid() returns -1; skip the check.
+// warnIfNonRoot logs a privileged-port warning to the status log.
+//
+// Called EARLY at agent startup — before connecting to master — so it always
+// appears in agent-status.log, even when stderr is unavailable (daemon mode).
+// The warning reminds operators that listen rules on ports 1–1023 require root
+// (or CAP_NET_BIND_SERVICE on Linux).
+func warnIfNonRoot(agentID string, client *comm.AgentClient, slog *logging.Logger) {
 	if runtime.GOOS == "windows" {
 		return
 	}
 	if os.Getuid() == 0 {
-		return // running as root — all ports accessible
+		return
 	}
 
 	msg := fmt.Sprintf(
-		"Agent %s is running as non-root (uid=%d). "+
-			"Only ports > 1024 can be configured — attempts to open ports 1–1023 will fail.",
+		"Agent %s running as non-root (uid=%d): listen rules on privileged ports "+
+			"(1-1023) will fail. Ensure assigned profiles only use ports > 1023, "+
+			"or restart with sudo / CAP_NET_BIND_SERVICE.",
 		agentID, os.Getuid(),
 	)
 
 	fmt.Fprintf(os.Stderr, "WARNING: %s\n", msg)
-	logger.Warn(msg)
+	slog.Warn(msg)
 
 	if client != nil {
 		if err := client.SendWarning(agentID, "NON_ROOT", msg); err != nil {
-			logger.Warn(fmt.Sprintf("Could not send non-root warning to master: %v", err))
+			slog.Warn(fmt.Sprintf("Could not forward non-root warning to master: %v", err))
 		}
 	}
 }
 
-// ─── Shutdown ─────────────────────────────────────────────────────────────────
-
-// Stop gracefully shuts down the agent.
 func (a *Agent) Stop() error {
-	a.logger.Info("Shutting down Agent...")
+	a.slog.Info("Shutting down agent...")
 	atomic.StoreInt32(&a.isRunning, 0)
 
 	a.listenerMgr.StopAll()
@@ -575,23 +550,17 @@ func (a *Agent) Stop() error {
 	return nil
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-// randomPayload returns a slice of n pseudo-random printable ASCII bytes.
-// Defined here in addition to traffic/generator.go so the agent can generate
-// payloads without importing the traffic package.
 func randomPayload(n int) []byte {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, n)
 	r := time.Now().UnixNano()
 	for i := range b {
-		r = r*6364136223846793005 + 1442695040888963407 // LCG
+		r = r*6364136223846793005 + 1442695040888963407
 		b[i] = charset[((r>>33)^r)%int64(len(charset))]
 	}
 	return b
 }
 
-// updateRules replaces the agent's rule set (used by connected-mode receiveMessages).
 func (a *Agent) updateRules(rules []*comm.TrafficRule) {
 	cfgRules := commRulesToConfig(rules)
 	a.applyRules(cfgRules)

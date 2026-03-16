@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"path/filepath"
 	"strings"
 )
 
@@ -101,6 +102,13 @@ func ParseExtendedConfigV2(filePath string) (*MasterConfig, error) {
 				config.TTL = ttl
 
 			case "PROFILE_DIR":
+				// Resolve relative paths against the directory that contains the
+				// config file, not the process working directory. This ensures
+				// profiles are found even when the binary is started from a
+				// different directory (e.g. daemon mode with absolute config path).
+				if !filepath.IsAbs(value) {
+					value = filepath.Join(filepath.Dir(filePath), value)
+				}
 				config.ProfileDir = value
 
 			case "CONFIG":

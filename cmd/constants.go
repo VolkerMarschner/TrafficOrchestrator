@@ -6,6 +6,12 @@ import "time"
 const (
 	defaultLogMaxSizeMB = 10
 	defaultLogMaxFiles  = 5
+
+	// Log file names (v0.4.6 — split into status + traffic logs)
+	masterStatusLogFile  = "master-status.log" // operational events (start/stop, agent register, config changes)
+	masterTrafficLogFile = "master-traffic.log" // rule distribution events (rules sent per agent)
+	agentStatusLogFile   = "agent-status.log"   // operational events (start/stop, connect, update)
+	agentTrafficLogFile  = "agent-traffic.log"  // traffic execution events (connections, listeners, rules)
 )
 
 // Timing

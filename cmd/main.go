@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"trafficorch/pkg/config"
 	"trafficorch/pkg/logging"
@@ -13,14 +14,12 @@ import (
 	"trafficorch/pkg/registry"
 )
 
-const version = "0.4.5"
+const version = "0.4.6"
 
 func main() {
 	args := os.Args[1:]
 
 	// ── Detect and strip internal daemon-child sentinel ───────────────────────
-	// When the process was launched by daemonize(), --daemon-child is appended
-	// to signal that we are already the background process.
 	daemonChild := false
 	{
 		filtered := args[:0]
@@ -181,6 +180,14 @@ Deployment (v0.4.5+):
     GET /version  — Current master version
     GET /agents   — Agent registry as JSON
 
+Logging (v0.4.6+):
+  master-status.log   Operational events: start/stop, agent register/disconnect,
+                      config changes, update notifications.
+  master-traffic.log  Rule distribution: rules sent per agent, profile resolution.
+  agent-status.log    Operational events: start/stop, master connect/disconnect,
+                      self-update, reconnect attempts.
+  agent-traffic.log   Traffic events: connections made, listeners opened, bytes sent.
+
 Auto-start:
   No arguments:  trafficorch looks for to.conf in the current directory.
   Found:     loads values and starts as agent or master.
@@ -211,7 +218,7 @@ func resolveLogPath(filename string) (string, error) {
 	return filepath.Join(absDir, filename), nil
 }
 
-// writePIDFile writes the current process PID to path (best-effort, errors are ignored).
+// writePIDFile writes the current process PID to path (best-effort).
 func writePIDFile(path string) {
 	_ = os.WriteFile(path, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644)
 }
@@ -252,42 +259,55 @@ func startMasterFromFile(configPath string) {
 	runMaster(masterCfg)
 }
 
-// runMaster validates the PSK, sets up logging, and runs the master server.
+// runMaster validates the PSK, sets up split logging, and runs the master server.
 func runMaster(masterCfg *config.MasterConfig) {
 	if err := netutils.ValidatePSKStrength(masterCfg.PSK); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: PSK does not meet security requirements: %v\n", err)
 		os.Exit(1)
 	}
 
-	logFile, err := resolveLogPath("traffic.log")
+	// Status logger — operational events
+	statusLogFile, err := resolveLogPath(masterStatusLogFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error resolving log path: %v\n", err)
 		os.Exit(1)
 	}
-
-	logger, err := logging.NewLogger(logFile, defaultLogMaxSizeMB, defaultLogMaxFiles)
+	slog, err := logging.NewLogger(statusLogFile, defaultLogMaxSizeMB, defaultLogMaxFiles)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to initialise logger: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to initialise status logger: %v\n", err)
 		os.Exit(1)
 	}
-	defer logger.Close()
+	defer slog.Close()
 
-	server, err := NewMasterServer(masterCfg, logger)
+	// Traffic logger — rule distribution events
+	trafficLogFile, err := resolveLogPath(masterTrafficLogFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving log path: %v\n", err)
+		os.Exit(1)
+	}
+	tlog, err := logging.NewLogger(trafficLogFile, defaultLogMaxSizeMB, defaultLogMaxFiles)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialise traffic logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer tlog.Close()
+
+	slog.Info(fmt.Sprintf("Traffic Orchestrator Master v%s starting", version))
+
+	server, err := NewMasterServer(masterCfg, tlog, slog)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create master server: %v\n", err)
 		os.Exit(1)
 	}
-	defer server.Stop(logger)
+	defer server.Stop(slog)
 
-	logger.Info(fmt.Sprintf("Starting Traffic Orchestrator Master v%s", version))
 	if err := server.Start(); err != nil {
-		logger.Error(fmt.Sprintf("Master server error: %v", err))
+		slog.Error(fmt.Sprintf("Master server error: %v", err))
 		os.Exit(1)
 	}
 }
 
-// handleAgentMode parses CLI flags, persists them as to.conf, then starts
-// the agent. Falls back to auto-start if no flags are supplied.
+// handleAgentMode parses CLI flags, persists them as to.conf, then starts the agent.
 func handleAgentMode(args []string) {
 	if len(args) == 0 {
 		tryAutoStart()
@@ -311,43 +331,66 @@ func handleAgentMode(args []string) {
 	startAgent(cfg)
 }
 
-// startAgent validates the PSK, initialises logging, tries to connect to master
-// and — if the master is unreachable — falls back to standalone mode.
+// startAgent validates the PSK, initialises split logging, emits an early
+// privilege warning, tries to connect to master and — if unreachable — falls
+// back to standalone mode.
 func startAgent(cfg *config.AgentConfig) {
 	if err := netutils.ValidatePSKStrength(cfg.PSK); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: PSK does not meet security requirements: %v\n", err)
 		os.Exit(1)
 	}
 
-	logFile, err := resolveLogPath("agent.log")
+	// Status logger — operational events
+	statusLogFile, err := resolveLogPath(agentStatusLogFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error resolving log path: %v\n", err)
 		os.Exit(1)
 	}
-
-	logger, err := logging.NewLogger(logFile, defaultLogMaxSizeMB, defaultLogMaxFiles)
+	slog, err := logging.NewLogger(statusLogFile, defaultLogMaxSizeMB, defaultLogMaxFiles)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to initialise logger: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to initialise status logger: %v\n", err)
 		os.Exit(1)
 	}
-	defer logger.Close()
+	defer slog.Close()
 
-	logger.Info(fmt.Sprintf("Starting Traffic Orchestrator Agent v%s", version))
+	// Traffic logger — traffic execution events
+	trafficLogFile, err := resolveLogPath(agentTrafficLogFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving log path: %v\n", err)
+		os.Exit(1)
+	}
+	tlog, err := logging.NewLogger(trafficLogFile, defaultLogMaxSizeMB, defaultLogMaxFiles)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialise traffic logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer tlog.Close()
+
+	slog.Info(fmt.Sprintf("Traffic Orchestrator Agent v%s starting", version))
+
+	// ── Early privilege warning (v0.4.6) ──────────────────────────────────────
+	// Emit before attempting to connect so the warning is always in the status
+	// log, including in daemon mode where stderr is discarded.
+	if runtime.GOOS != "windows" && os.Getuid() != 0 {
+		warnIfNonRoot(cfg.AgentID, nil, slog)
+	}
 
 	// Try connected mode first.
-	agent, err := NewAgent(cfg, logger)
+	agent, err := NewAgent(cfg, tlog, slog)
 	if err != nil {
-		logger.Warn(fmt.Sprintf("Cannot connect to master (%v) — trying standalone mode...", err))
+		slog.Warn(fmt.Sprintf("Cannot connect to master (%v) — trying standalone mode...", err))
 		mCfg := masterConnInfo{host: cfg.MasterHost, port: cfg.Port, psk: cfg.PSK}
-		startStandaloneWithLogger(mCfg, cfg.AgentID, logger)
+		startStandaloneWithLogger(mCfg, cfg.AgentID, tlog, slog)
 		return
 	}
 
-	// Non-root check (connected mode — warning sent to master).
-	checkNonRootAndWarn(agent.agentID, agent.client, logger)
+	// Forward privilege warning to master now that we have a connection.
+	if runtime.GOOS != "windows" && os.Getuid() != 0 {
+		warnIfNonRoot(agent.agentID, agent.client, slog)
+	}
 
 	if err := agent.Start(); err != nil {
-		logger.Error(fmt.Sprintf("Agent error: %v", err))
+		slog.Error(fmt.Sprintf("Agent error: %v", err))
 		os.Exit(1)
 	}
 }
@@ -355,26 +398,42 @@ func startAgent(cfg *config.AgentConfig) {
 // startStandalone is the standalone entry point used when no master credentials
 // are available from CLI (e.g. auto-start from instructions.conf alone).
 func startStandalone(mCfg masterConnInfo, agentID string) {
-	logFile, err := resolveLogPath("agent.log")
+	statusLogFile, err := resolveLogPath(agentStatusLogFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error resolving log path: %v\n", err)
 		os.Exit(1)
 	}
-
-	logger, err := logging.NewLogger(logFile, defaultLogMaxSizeMB, defaultLogMaxFiles)
+	slog, err := logging.NewLogger(statusLogFile, defaultLogMaxSizeMB, defaultLogMaxFiles)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to initialise logger: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to initialise status logger: %v\n", err)
 		os.Exit(1)
 	}
-	defer logger.Close()
+	defer slog.Close()
 
-	logger.Info(fmt.Sprintf("Starting Traffic Orchestrator Agent v%s (standalone)", version))
-	startStandaloneWithLogger(mCfg, agentID, logger)
+	trafficLogFile, err := resolveLogPath(agentTrafficLogFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving log path: %v\n", err)
+		os.Exit(1)
+	}
+	tlog, err := logging.NewLogger(trafficLogFile, defaultLogMaxSizeMB, defaultLogMaxFiles)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialise traffic logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer tlog.Close()
+
+	slog.Info(fmt.Sprintf("Traffic Orchestrator Agent v%s starting (standalone)", version))
+	startStandaloneWithLogger(mCfg, agentID, tlog, slog)
 }
 
 // startStandaloneWithLogger creates a standalone agent and starts it.
-func startStandaloneWithLogger(mCfg masterConnInfo, agentID string, logger *logging.Logger) {
-	agent, err := newStandaloneAgent(config.InstructionsConfFile, mCfg, agentID, logger)
+func startStandaloneWithLogger(mCfg masterConnInfo, agentID string, tlog, slog *logging.Logger) {
+	// Early privilege warning in standalone path as well.
+	if runtime.GOOS != "windows" && os.Getuid() != 0 {
+		warnIfNonRoot(agentID, nil, slog)
+	}
+
+	agent, err := newStandaloneAgent(config.InstructionsConfFile, mCfg, agentID, tlog, slog)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			msg := fmt.Sprintf(
@@ -384,19 +443,16 @@ func startStandaloneWithLogger(mCfg masterConnInfo, agentID string, logger *logg
 				config.InstructionsConfFile,
 			)
 			fmt.Fprint(os.Stderr, msg)
-			logger.Error("Standalone start failed: " + config.InstructionsConfFile + " not found and master unreachable")
+			slog.Error("Standalone start failed: " + config.InstructionsConfFile + " not found and master unreachable")
 		} else {
 			fmt.Fprintf(os.Stderr, "Standalone start failed: %v\n", err)
-			logger.Error(fmt.Sprintf("Standalone start failed: %v", err))
+			slog.Error(fmt.Sprintf("Standalone start failed: %v", err))
 		}
 		os.Exit(1)
 	}
 
-	// Non-root check (standalone mode — warning logged only, no master to notify).
-	checkNonRootAndWarn(agent.agentID, nil, logger)
-
 	if err := agent.Start(); err != nil {
-		logger.Error(fmt.Sprintf("Agent error: %v", err))
+		slog.Error(fmt.Sprintf("Agent error: %v", err))
 		os.Exit(1)
 	}
 }
