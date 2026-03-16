@@ -168,7 +168,7 @@ Modes:
 Deployment (v0.4.5+):
   Bootstrap new agent:
     curl -O http://<master-ip>:9001/binary && chmod +x binary
-    ./binary --agent --master <master-ip> --port 9000 --psk <key>
+    ./binary --agent --master <master-ip> --port 9000 --psk <key> --id <agent-id>
 
   Auto-update:
     The master serves its own binary on port 9001. When an agent connects
