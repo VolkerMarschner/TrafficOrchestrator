@@ -147,7 +147,7 @@ trafficorch --agent --master <HOST> --port <PORT> --psk <KEY> [--id <ID>]
 |------|----------|-------------|
 | `--master HOST` | **Yes** | Master hostname or IP address |
 | `--port PORT`   | **Yes** | Master port |
-| `--psk KEY`     | **Yes** | Pre-shared key (must match master) |
+| `--psk KEY`     | No  | Pre-shared key (must match master; or `TRAFFICORCH_PSK` env var) |
 | `--id ID`       | No  | Agent identifier shown in master logs (default: `agent-unknown`) |
 
 **Example:**
@@ -274,7 +274,7 @@ trafficorch --help      # print full usage
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `TRAFFICORCH_PSK` | Pre-shared key (alternative to `--psk`) | — |
+| `TRAFFICORCH_PSK` | Pre-shared key — alternative to `--psk` for both master and agent mode; also honoured when loading `to.conf` | — |
 | `TRAFFICORCH_LOG_DIR` | Directory for log files (`traffic.log` / `agent.log`) | `.` (current dir) |
 
 Copy `.env.example` → `.env` and adjust values; then `source .env` before running.

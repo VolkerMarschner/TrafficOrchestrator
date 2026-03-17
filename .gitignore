@@ -28,6 +28,7 @@ coverage.html
 vm-instance-data.txt
 FEATURE-REQUEST.md
 VC-requirements-TrafficOrchestrator.md
+AUDIT-CONTEXT.md
 
 # ─── Site-specific config files (use configs/*.conf.example as templates) ─────
 config_mcl_*.conf
