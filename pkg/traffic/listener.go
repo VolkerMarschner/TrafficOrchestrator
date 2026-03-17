@@ -101,7 +101,7 @@ func (m *ListenerManager) StopListener(protocol string, port int) {
 
 func (l *portListener) startTCP() error {
 	addr := fmt.Sprintf(":%d", l.port)
-	ln, err := net.Listen("tcp", addr)
+	ln, err := net.Listen("tcp4", addr)
 	if err != nil {
 		return fmt.Errorf("cannot open TCP listener on port %d: %w", l.port, err)
 	}
@@ -153,7 +153,7 @@ func handleTCPConn(conn net.Conn, port int) {
 
 func (l *portListener) startUDP() error {
 	addr := fmt.Sprintf(":%d", l.port)
-	pc, err := net.ListenPacket("udp", addr)
+	pc, err := net.ListenPacket("udp4", addr)
 	if err != nil {
 		return fmt.Errorf("cannot open UDP listener on port %d: %w", l.port, err)
 	}

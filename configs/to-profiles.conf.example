@@ -1,6 +1,6 @@
 # ============================================================
 # Traffic Orchestrator — Master config with Profile system
-# v0.4.0 example
+# v0.4.12 example
 #
 # Save as  to.conf  and run  ./trafficorch  (no arguments).
 # ============================================================
@@ -12,10 +12,17 @@ TTL         = 300
 PROFILE_DIR = ./profiles     # directory containing *.profile files
 
 # ─── Named targets ───────────────────────────────────────────
-# Format:  NAME = IP  [#tag:<tagname>]
+# Format:  NAME = IP  #tag:<tagname>
 #
-# Tags are used in profile rules via  group:<tagname>
-# Multiple tags per host: repeat  #tag:  tokens (comma is also OK)
+# IMPORTANT — tag syntax rules:
+#   CORRECT:   CLIENT1 = 10.0.0.10  #tag:client
+#   WRONG:     CLIENT1 = 10.0.0.10  [#client:client]   ← brackets corrupt the IP!
+#   WRONG:     CLIENT1 = 10.0.0.10  #client:client     ← missing "tag:" prefix, tag ignored!
+#
+# The keyword is exactly  #tag:  — everything else is not recognised.
+# Tags are referenced in profile rules as  group:<tagname>  (e.g. group:client).
+# Multiple tags per host: add multiple  #tag:  tokens on the same line.
+#   Example:  SRV1 = 10.0.0.5  #tag:web #tag:dmz
 
 [TARGETS]
 DC1         = 10.0.0.1   #tag:dc
@@ -26,7 +33,14 @@ WEB1        = 10.0.0.20  #tag:web
 FS1         = 10.0.0.30  #tag:fileserver
 
 # ─── Profile assignments ──────────────────────────────────────
-# Format:  <host-IP or target-name> = <profile>[, <profile>, ...]
+# Format:  <target-name or IP> = <profile-name>[, <profile-name>, ...]
+#
+# IMPORTANT — use the profile NAME, not the filename:
+#   The profile name is the  NAME =  value from the profile's [META] section,
+#   NOT the filename.  Do NOT include the  .profile  extension here.
+#
+#   CORRECT:   CLIENT1 = windows_client          ← matches NAME = windows_client in [META]
+#   WRONG:     CLIENT1 = windows_client.profile  ← extension causes "profile not found" error
 #
 # Multiple profiles are merged — rules from all assigned profiles
 # are applied to the agent.

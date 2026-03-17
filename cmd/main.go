@@ -14,7 +14,7 @@ import (
 	"trafficorch/pkg/registry"
 )
 
-const version = "0.4.12"
+const version = "0.4.13"
 
 func main() {
 	args := os.Args[1:]
