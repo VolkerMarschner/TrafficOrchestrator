@@ -285,19 +285,28 @@ Copy `.env.example` → `.env` and adjust values; then `source .env` before runn
 
 ### Bootstrap new agents
 
-The master automatically serves its own binary over HTTP on **port 9001** — no PSK required for the download:
+The master serves platform binaries over HTTP on **port 9001** — no PSK required for the download.
+
+To bootstrap a fresh host, download the binary that matches its OS and architecture:
 
 ```bash
-# On a fresh host with no binary yet
-curl -O http://<master-ip>:9001/binary
+# Linux amd64
+curl -O http://<master-ip>:9001/binary?platform=linux/amd64
+chmod +x binary
+./binary --agent --master <master-ip> --port 9000 --psk <key> --id <agent-id>
+
+# Linux arm64 (e.g. Raspberry Pi)
+curl -O "http://<master-ip>:9001/binary?platform=linux/arm64"
 chmod +x binary
 ./binary --agent --master <master-ip> --port 9000 --psk <key> --id <agent-id>
 ```
 
+If the `platform` query parameter is omitted, the master falls back to serving its own binary (works only if agent and master share the same OS/architecture).
+
 | HTTP endpoint | Description |
 |---------------|-------------|
-| `GET /binary`  | The master binary (`application/octet-stream`) |
-| `GET /sha256`  | SHA-256 checksum of the binary |
+| `GET /binary?platform=linux/arm64` | Platform-specific binary (`application/octet-stream`) |
+| `GET /sha256?platform=linux/arm64` | SHA-256 checksum for the given platform |
 | `GET /version` | Master version string |
 | `GET /agents`  | Agent registry as JSON |
 
@@ -306,11 +315,20 @@ chmod +x binary
 When an agent registers or sends a heartbeat with a version **older than the master**, the master sends an `UPDATE_AVAILABLE` message over the authenticated control channel.
 
 The agent:
-1. Downloads the binary from `http://<master-host>:9001/binary`
+1. Downloads the binary from `http://<master-host>:9001/binary?platform=<os>/<arch>` (its own platform is sent automatically)
 2. Verifies the SHA-256 (received over the HMAC-authenticated control channel)
-3. Replaces the running binary and restarts automatically
+3. Replaces the running binary and restarts automatically (original is backed up as `<binary>.bak` and removed on next successful start)
 
 No manual intervention needed. Updates propagate to all outdated agents within one heartbeat cycle (≤ 30 s).
+
+> **Multi-architecture deployments (v0.4.7+):** The master must have all relevant platform binaries in its **working directory** alongside itself. At startup it scans for files matching the naming convention `trafficorch-{os}-{arch}[.exe]` and pre-computes their SHA-256. Only platforms with a binary present on disk can be auto-updated. Agents on platforms without a matching binary on the master continue running their current version and will log a checksum warning.
+>
+> Required files per supported platform:
+> | Platform | Filename |
+> |----------|----------|
+> | Linux amd64 | `trafficorch-linux-amd64` |
+> | Linux arm64 | `trafficorch-linux-arm64` |
+> | Windows amd64 | `trafficorch-windows-amd64.exe` |
 
 ### Agent registry
 
