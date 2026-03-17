@@ -352,30 +352,73 @@ func (ms *MasterServer) loadConfig() error {
 	return nil
 }
 
-// watchConfigFile monitors the config file for changes.
+// watchConfigFile monitors the config file and the profile directory for changes.
+// A reload is triggered whenever the config file or any .profile file is modified,
+// added, or removed (checked every configWatchInterval).
 func (ms *MasterServer) watchConfigFile() {
-	var lastModTime time.Time
+	var lastConfigMod time.Time
+	var lastProfileSig time.Time // latest mtime across all profile files
 
 	for {
 		select {
 		case <-time.After(configWatchInterval):
-			info, err := os.Stat(ms.configPath)
-			if err != nil {
+			changed := false
+
+			// ── Check main config file ──────────────────────────────────────
+			if info, err := os.Stat(ms.configPath); err != nil {
 				ms.slog.Error(fmt.Sprintf("Config file not found: %s", ms.configPath))
-				continue
+			} else {
+				if !info.ModTime().Equal(lastConfigMod) && !lastConfigMod.IsZero() {
+					ms.slog.Info("Config file changed — reloading...")
+					changed = true
+				}
+				lastConfigMod = info.ModTime()
 			}
-			modTime := info.ModTime()
-			if !modTime.Equal(lastModTime) && !lastModTime.IsZero() {
-				ms.slog.Info("Config file changed — reloading...")
+
+			// ── Check profile directory ─────────────────────────────────────
+			ms.ruleMu.RLock()
+			profileDir := ms.cfg.ProfileDir
+			ms.ruleMu.RUnlock()
+
+			if profileDir != "" {
+				sig := latestProfileMod(profileDir)
+				if !lastProfileSig.IsZero() && !sig.Equal(lastProfileSig) {
+					ms.slog.Info(fmt.Sprintf("Profile directory changed (%s) — reloading...", profileDir))
+					changed = true
+				}
+				lastProfileSig = sig
+			}
+
+			if changed {
 				go ms.loadConfigAndNotify()
 			}
-			lastModTime = modTime
 
 		case <-ms.fileWatcher:
 			ms.slog.Info("Config reload triggered manually")
 			go ms.loadConfigAndNotify()
 		}
 	}
+}
+
+// latestProfileMod returns the most recent modification time across all .profile
+// files in dir. Returns zero time if dir is empty or unreadable.
+func latestProfileMod(dir string) time.Time {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return time.Time{}
+	}
+	var latest time.Time
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".profile" {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			if info.ModTime().After(latest) {
+				latest = info.ModTime()
+			}
+		}
+	}
+	return latest
 }
 
 // loadConfigAndNotify reloads config and pushes updates to all agents.
