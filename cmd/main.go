@@ -14,7 +14,7 @@ import (
 	"trafficorch/pkg/registry"
 )
 
-const version = "0.4.6"
+const version = "0.4.7"
 
 func main() {
 	args := os.Args[1:]
@@ -367,6 +367,16 @@ func startAgent(cfg *config.AgentConfig) {
 	defer tlog.Close()
 
 	slog.Info(fmt.Sprintf("Traffic Orchestrator Agent v%s starting", version))
+
+	// ── Clean up backup left by a previous self-update (v0.4.7) ───────────────
+	// apply_unix.go renames the old binary to <binary>.bak before exec'ing the new one.
+	// If exec succeeded, the .bak file is never removed by the old process. Clean it up now.
+	if exe, err := os.Executable(); err == nil {
+		bakFile := exe + ".bak"
+		if err := os.Remove(bakFile); err == nil {
+			slog.Info("Cleaned up previous-version backup: " + bakFile)
+		}
+	}
 
 	// ── Early privilege warning (v0.4.6) ──────────────────────────────────────
 	// Emit before attempting to connect so the warning is always in the status

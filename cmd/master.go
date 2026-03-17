@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -38,8 +40,18 @@ type MasterServer struct {
 	reg            *registry.Registry
 	httpSrv        *http.Server
 	binaryPath     string // path to own executable
-	binarySHA      string // pre-computed SHA-256 of own binary
+	binarySHA      string // pre-computed SHA-256 of own binary (fallback)
 	updateNotified sync.Map // agentID → struct{}: agents already sent UPDATE_AVAILABLE
+
+	// v0.4.7: multi-arch distribution
+	// Key: "linux/amd64", "linux/arm64", "windows/amd64", …
+	platformBinaries map[string]platformBinary
+}
+
+// platformBinary holds the resolved path and pre-computed SHA-256 for a platform binary.
+type platformBinary struct {
+	path   string
+	sha256 string
 }
 
 // NewMasterServer creates a new master server instance.
@@ -146,10 +158,17 @@ func (ms *MasterServer) onAgentDisconnect(agentID string) {
 // ─── Update notification ──────────────────────────────────────────────────────
 
 // sendUpdateNotification sends an UPDATE_AVAILABLE message to an agent.
+// It looks up the agent's platform and includes the SHA-256 of the binary that will
+// actually be served for that platform, so the agent can verify the download correctly.
 func (ms *MasterServer) sendUpdateNotification(agentID string) {
 	if ms.binarySHA == "" {
 		return // distribution server not available
 	}
+
+	// Resolve the SHA-256 for the agent's specific platform (v0.4.7+).
+	platform := ms.server.GetAgentPlatform(agentID)
+	_, sha := ms.binaryForPlatform(platform)
+
 	msg := &comm.UpdateAvailableMessage{
 		BaseMessage: comm.BaseMessage{
 			Type:      comm.MsgUpdateAvailable,
@@ -158,18 +177,34 @@ func (ms *MasterServer) sendUpdateNotification(agentID string) {
 		},
 		NewVersion: version,
 		HTTPPort:   distributionPort,
-		SHA256:     ms.binarySHA,
+		SHA256:     sha,
 	}
 	if err := ms.server.SendToAgent(agentID, msg); err != nil {
 		ms.slog.Warn(fmt.Sprintf("Failed to send UPDATE_AVAILABLE to %s: %v", agentID, err))
 	} else {
-		ms.slog.Info(fmt.Sprintf("Sent UPDATE_AVAILABLE to agent %s (new: v%s)", agentID, version))
+		ms.slog.Info(fmt.Sprintf("Sent UPDATE_AVAILABLE to agent %s (platform: %s, new: v%s)", agentID, platform, version))
 	}
 }
 
 // ─── Distribution HTTP server ─────────────────────────────────────────────────
 
+// platformBinaryName returns the expected filename for a given "os/arch" platform string,
+// e.g. "linux/arm64" → "trafficorch-linux-arm64", "windows/amd64" → "trafficorch-windows-amd64.exe".
+func platformBinaryName(platform string) string {
+	parts := strings.SplitN(platform, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	name := fmt.Sprintf("trafficorch-%s-%s", parts[0], parts[1])
+	if parts[0] == "windows" {
+		name += ".exe"
+	}
+	return name
+}
+
 // startDistributionServer starts the HTTP server on distributionPort.
+// It pre-computes SHA-256 checksums for the master's own binary and for any
+// platform-specific binaries found in the same directory (trafficorch-{os}-{arch}[.exe]).
 func (ms *MasterServer) startDistributionServer() error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -182,6 +217,21 @@ func (ms *MasterServer) startDistributionServer() error {
 		return fmt.Errorf("cannot compute binary checksum: %w", err)
 	}
 	ms.binarySHA = sha
+
+	// Scan sibling binaries for all known platforms.
+	ms.platformBinaries = make(map[string]platformBinary)
+	knownPlatforms := []string{"linux/amd64", "linux/arm64", "windows/amd64"}
+	binDir := filepath.Dir(exe)
+	for _, p := range knownPlatforms {
+		name := platformBinaryName(p)
+		candidate := filepath.Join(binDir, name)
+		candidateSHA, err := update.BinaryChecksum(candidate)
+		if err != nil {
+			continue // binary not present for this platform
+		}
+		ms.platformBinaries[p] = platformBinary{path: candidate, sha256: candidateSHA}
+		ms.slog.Info(fmt.Sprintf("Platform binary available: %s → %s (SHA256: %s...)", p, name, candidateSHA[:16]))
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/binary", ms.handleBinaryDownload)
@@ -207,12 +257,26 @@ func (ms *MasterServer) startDistributionServer() error {
 	return nil
 }
 
+// binaryForPlatform returns the path and SHA-256 for the binary best suited for platform.
+// Falls back to the master's own binary if no platform-specific binary is available.
+func (ms *MasterServer) binaryForPlatform(platform string) (path, sha string) {
+	if pb, ok := ms.platformBinaries[platform]; ok {
+		return pb.path, pb.sha256
+	}
+	return ms.binaryPath, ms.binarySHA
+}
+
 func (ms *MasterServer) handleBinaryDownload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	f, err := os.Open(ms.binaryPath)
+
+	// Honour optional ?platform=linux/arm64 query param (v0.4.7+).
+	platform := r.URL.Query().Get("platform")
+	binaryPath, sha := ms.binaryForPlatform(platform)
+
+	f, err := os.Open(binaryPath)
 	if err != nil {
 		http.Error(w, "binary unavailable", http.StatusInternalServerError)
 		return
@@ -225,7 +289,7 @@ func (ms *MasterServer) handleBinaryDownload(w http.ResponseWriter, r *http.Requ
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
-	w.Header().Set("X-SHA256", ms.binarySHA)
+	w.Header().Set("X-SHA256", sha)
 	w.Header().Set("X-Version", version)
 	if r.Method == http.MethodHead {
 		return
@@ -233,8 +297,10 @@ func (ms *MasterServer) handleBinaryDownload(w http.ResponseWriter, r *http.Requ
 	io.Copy(w, f) //nolint:errcheck
 }
 
-func (ms *MasterServer) handleSHA256(w http.ResponseWriter, _ *http.Request) {
-	fmt.Fprintln(w, ms.binarySHA)
+func (ms *MasterServer) handleSHA256(w http.ResponseWriter, r *http.Request) {
+	platform := r.URL.Query().Get("platform")
+	_, sha := ms.binaryForPlatform(platform)
+	fmt.Fprintln(w, sha)
 }
 
 func (ms *MasterServer) handleVersion(w http.ResponseWriter, _ *http.Request) {

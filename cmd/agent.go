@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -274,8 +275,11 @@ func (a *Agent) applyUpdate(msg comm.UpdateAvailableMessage) {
 		return
 	}
 
-	downloadURL := fmt.Sprintf("http://%s:%d/binary", a.masterCfg.host, msg.HTTPPort)
-	a.slog.Info(fmt.Sprintf("Self-update: downloading v%s from %s", msg.NewVersion, downloadURL))
+	// Pass our own platform so the master can serve the correct architecture binary (v0.4.7+).
+	platform := fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)
+	downloadURL := fmt.Sprintf("http://%s:%d/binary?platform=%s",
+		a.masterCfg.host, msg.HTTPPort, url.QueryEscape(platform))
+	a.slog.Info(fmt.Sprintf("Self-update: downloading v%s for %s from %s", msg.NewVersion, platform, downloadURL))
 
 	restartArgs := make([]string, 0, len(os.Args)-1)
 	for _, arg := range os.Args[1:] {
