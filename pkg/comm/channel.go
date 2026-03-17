@@ -239,7 +239,7 @@ func (s *MasterServer) handleConnection(conn net.Conn) {
 
 	if err := channel.WriteMessage(ack); err != nil {
 		log.Printf("comm: failed to send ACK to %s: %v", regMsg.AgentID, err)
-		s.removeAgent(regMsg.AgentID)
+		s.removeAgent(regMsg.AgentID, channel)
 		return
 	}
 
@@ -261,7 +261,11 @@ func (s *MasterServer) processMessages(channel *Channel, agentID string) {
 			} else {
 				log.Printf("comm: lost connection to agent %s: %v", agentID, err)
 			}
-			s.removeAgent(agentID)
+			// Pass the channel pointer so removeAgent only cleans up this specific
+			// connection. Without this check a stale processMessages goroutine from
+			// a previous connection would delete the entry for a newly reconnected
+			// agent, causing all subsequent SendToAgent calls to fail with "not found".
+			s.removeAgent(agentID, channel)
 			return
 		}
 
@@ -316,12 +320,19 @@ func (s *MasterServer) processMessages(channel *Channel, agentID string) {
 	}
 }
 
-func (s *MasterServer) removeAgent(agentID string) {
+// removeAgent removes agentID from the connected-agents map and fires onDisconnect.
+// ch must be the Channel pointer that belongs to the caller's connection.
+// If the agent has already reconnected (s.agents[agentID] points to a different
+// Channel), this is a no-op — the stale goroutine must not evict the live entry.
+func (s *MasterServer) removeAgent(agentID string, ch *Channel) {
 	s.mu.Lock()
-	_, existed := s.agents[agentID]
-	if existed {
-		s.agents[agentID].channel.Close()
+	ac, existed := s.agents[agentID]
+	if existed && ac.channel == ch {
+		// Only evict when it is really our channel that is dying.
+		ch.Close()
 		delete(s.agents, agentID)
+	} else {
+		existed = false // stale goroutine — leave the live entry alone
 	}
 	s.mu.Unlock()
 	if existed && s.onDisconnect != nil {
