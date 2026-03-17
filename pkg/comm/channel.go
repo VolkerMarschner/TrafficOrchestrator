@@ -19,11 +19,21 @@ import (
 // hmacSize is the byte length of a SHA-256 HMAC signature appended to every message.
 const hmacSize = 32
 
+// maxMessageSize is the largest message body (bytes) that ReadMessage will accept.
+// This prevents a misbehaving or malicious peer from causing an OOM by sending a
+// 4-byte length prefix claiming a multi-gigabyte payload (K3).
+const maxMessageSize = 10 * 1024 * 1024 // 10 MB
+
 // Channel represents a PSK-authenticated, length-prefixed message channel over a net.Conn.
+// rmu and wmu are separate so that concurrent reads and writes never block each other.
+// TCP is full-duplex; a single shared mutex would cause reads (blocking up to
+// ChannelIdleTimeout = 3 min) to starve outgoing writes such as CONFIG_UPDATE and
+// heartbeats (K1).
 type Channel struct {
 	conn net.Conn
 	psk  string
-	mu   sync.Mutex
+	rmu  sync.Mutex // guards ReadMessage only
+	wmu  sync.Mutex // guards WriteMessage only
 }
 
 // NewChannel wraps an existing net.Conn in a Channel using the given pre-shared key.
@@ -36,8 +46,8 @@ func NewChannel(conn net.Conn, psk string) *Channel {
 // permanently-silent connections are eventually cleaned up.
 // Returns the parsed BaseMessage (for type dispatch) and the raw JSON bytes.
 func (c *Channel) ReadMessage() (*BaseMessage, []byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
 
 	// Set a per-read deadline so idle connections are not held open forever.
 	if err := c.conn.SetReadDeadline(time.Now().Add(ChannelIdleTimeout)); err != nil {
@@ -49,6 +59,10 @@ func (c *Channel) ReadMessage() (*BaseMessage, []byte, error) {
 		return nil, nil, err // caller checks net.Error.Timeout()
 	}
 	msgLen := binary.BigEndian.Uint32(lenBuf[:])
+
+	if msgLen > maxMessageSize {
+		return nil, nil, fmt.Errorf("message too large: %d bytes (max %d)", msgLen, maxMessageSize)
+	}
 
 	body := make([]byte, msgLen)
 	if _, err := io.ReadFull(c.conn, body); err != nil {
@@ -81,8 +95,8 @@ func (c *Channel) ReadMessage() (*BaseMessage, []byte, error) {
 // WriteMessage serialises msg to JSON, appends an HMAC signature, and sends it
 // over the channel with a 4-byte big-endian length prefix.
 func (c *Channel) WriteMessage(msg interface{}) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 
 	body, err := Serialize(msg)
 	if err != nil {
@@ -114,9 +128,10 @@ func (c *Channel) signMessage(data []byte) []byte {
 }
 
 // Close closes the underlying network connection.
+// net.Conn.Close() is safe to call concurrently with Read/Write; it will cause
+// any pending ReadMessage/WriteMessage to return an error immediately.
+// No mutex is needed here — c.conn is immutable after NewChannel().
 func (c *Channel) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.conn != nil {
 		return c.conn.Close()
 	}

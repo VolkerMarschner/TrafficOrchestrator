@@ -9,8 +9,11 @@ import (
 )
 
 // updateBat is a batch script that waits for the current process to exit,
-// swaps the binary files, and restarts the new binary without arguments
-// (the agent will pick up its configuration from to.conf on restart).
+// swaps the binary files, and restarts the new binary.
+// %s placeholders: tmpFile, currentBinary, currentBinary, restartArgs.
+// Note: arguments containing spaces or special batch characters are not supported.
+// In practice this is not an issue because agents persist their configuration to
+// to.conf on first run, so restartArgs is typically empty on self-update. (N3)
 const updateBat = `@echo off
 timeout /t 3 /nobreak > nul
 move /y "%s" "%s"
@@ -18,16 +21,24 @@ if errorlevel 1 (
     echo Update failed: could not replace binary
     exit /b 1
 )
-start "" "%s"
+start "" "%s" %s
 del "%%~f0"
 `
 
 // applyUpdate writes a helper batch script that swaps the new binary into place
 // after this process exits, then exits the current process.
 // The batch script deletes itself on completion.
-func applyUpdate(tmpFile, currentBinary string, _ []string) error {
+func applyUpdate(tmpFile, currentBinary string, restartArgs []string) error {
 	batPath := currentBinary + "_update.bat"
-	script := fmt.Sprintf(updateBat, tmpFile, currentBinary, currentBinary)
+
+	// Build a simple space-separated argument string for the batch script.
+	// Arguments with spaces or special characters are not supported — see comment on updateBat.
+	argStr := ""
+	for _, arg := range restartArgs {
+		argStr += " " + arg
+	}
+
+	script := fmt.Sprintf(updateBat, tmpFile, currentBinary, currentBinary, argStr)
 
 	if err := os.WriteFile(batPath, []byte(script), 0755); err != nil {
 		os.Remove(tmpFile)

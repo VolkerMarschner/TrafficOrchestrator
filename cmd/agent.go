@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -51,6 +53,16 @@ type Agent struct {
 
 	// stopOnce guards the single close(stopChan) in Stop() to prevent double-close panics.
 	stopOnce sync.Once
+
+	// trafficCancel cancels all currently running executeTraffic goroutines.
+	// Guarded by a.mu. Set by applyRules() and startTraffic(); called by
+	// stopTraffic() and Stop(). Fixes H1 (TRAFFIC_STOP no-op) and H2
+	// (applyRules starts new goroutines without stopping old ones).
+	trafficCancel context.CancelFunc
+
+	// reconnecting prevents multiple concurrent reconnectToMaster() invocations
+	// (e.g. ttlReconnectLoop and receiveMessages error path racing). (H7)
+	reconnecting int32 // accessed via sync/atomic (0=idle, 1=reconnecting)
 
 	// v0.4.6: split logging
 	slog *logging.Logger // agent-status.log  — start/stop, connect, update events
@@ -173,12 +185,21 @@ func (a *Agent) Start() error {
 	return a.Stop()
 }
 
-// applyRules stops existing listeners, starts new ones for "listen" rules,
-// and launches goroutines for "connect" rules.
+// applyRules stops existing listeners and running traffic goroutines, then
+// starts new ones for the incoming rule set.
+//
+// H2: The previous executeTraffic context is cancelled before new goroutines
+// are started, so old rules do not continue running alongside new ones.
 func (a *Agent) applyRules(rules []*config.TrafficRule) {
 	a.listenerMgr.StopAll()
 
+	// Cancel previous connect-rule goroutines and create a fresh context.
 	a.mu.Lock()
+	if a.trafficCancel != nil {
+		a.trafficCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.trafficCancel = cancel
 	a.currentRules = rules
 	a.mu.Unlock()
 
@@ -198,7 +219,7 @@ func (a *Agent) applyRules(rules []*config.TrafficRule) {
 	}
 
 	if len(connectRules) > 0 {
-		go a.executeTraffic(connectRules)
+		go a.executeTraffic(ctx, connectRules)
 	}
 }
 
@@ -349,11 +370,19 @@ func (a *Agent) saveInstructions(ttl int, rules []*config.TrafficRule) {
 
 func (a *Agent) startTraffic(rules []*comm.TrafficRule) {
 	if atomic.LoadInt32(&a.isRunning) != 0 {
-		go a.executeTraffic(rules)
+		// Cancel previous traffic and start fresh (same pattern as applyRules).
+		a.mu.Lock()
+		if a.trafficCancel != nil {
+			a.trafficCancel()
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		a.trafficCancel = cancel
+		a.mu.Unlock()
+		go a.executeTraffic(ctx, rules)
 	}
 }
 
-func (a *Agent) executeTraffic(rules []*comm.TrafficRule) {
+func (a *Agent) executeTraffic(ctx context.Context, rules []*comm.TrafficRule) {
 	a.tlog.Info(fmt.Sprintf("Starting traffic generation for %d rule(s)", len(rules)))
 
 	var wg sync.WaitGroup
@@ -364,15 +393,17 @@ func (a *Agent) executeTraffic(rules []*comm.TrafficRule) {
 		wg.Add(1)
 		go func(r *comm.TrafficRule) {
 			defer wg.Done()
-			a.executeSingleRule(r)
+			a.executeSingleRule(ctx, r)
 		}(rule)
 	}
 
 	wg.Wait()
-	a.tlog.Info(fmt.Sprintf("Traffic generation completed for %d rule(s)", len(rules)))
+	if ctx.Err() == nil {
+		a.tlog.Info(fmt.Sprintf("Traffic generation completed for %d rule(s)", len(rules)))
+	}
 }
 
-func (a *Agent) executeSingleRule(rule *comm.TrafficRule) {
+func (a *Agent) executeSingleRule(ctx context.Context, rule *comm.TrafficRule) {
 	address := net.JoinHostPort(rule.Target, strconv.Itoa(rule.Port))
 	connCount := 0
 
@@ -381,6 +412,12 @@ func (a *Agent) executeSingleRule(rule *comm.TrafficRule) {
 	for {
 		if atomic.LoadInt32(&a.isRunning) == 0 {
 			return
+		}
+		// H1/H2: exit immediately when TRAFFIC_STOP or a new applyRules cancels our context.
+		select {
+		case <-ctx.Done():
+			return
+		default:
 		}
 
 		var err error
@@ -404,10 +441,14 @@ func (a *Agent) executeSingleRule(rule *comm.TrafficRule) {
 			break
 		}
 
+		sleepDur := defaultConnectionDelay
 		if rule.Interval > 0 {
-			time.Sleep(time.Duration(rule.Interval) * time.Second)
-		} else {
-			time.Sleep(defaultConnectionDelay)
+			sleepDur = time.Duration(rule.Interval) * time.Second
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(sleepDur):
 		}
 	}
 
@@ -449,8 +490,15 @@ func (a *Agent) dialUDP(address, ruleName string) error {
 	return nil
 }
 
+// stopTraffic cancels all running executeTraffic goroutines. (H1)
 func (a *Agent) stopTraffic() {
-	a.tlog.Info("Stopping traffic generation...")
+	a.mu.Lock()
+	if a.trafficCancel != nil {
+		a.trafficCancel()
+		a.trafficCancel = nil
+	}
+	a.mu.Unlock()
+	a.tlog.Info("Traffic stopped")
 }
 
 // sendHeartbeatLoop sends periodic heartbeats to the master.
@@ -512,6 +560,13 @@ func (a *Agent) ttlReconnectLoop(instrConf *config.InstructionsConf) {
 }
 
 func (a *Agent) reconnectToMaster() {
+	// H7: prevent two concurrent reconnect attempts (e.g. ttlReconnectLoop and
+	// receiveMessages error path both calling reconnectToMaster at the same time).
+	if !atomic.CompareAndSwapInt32(&a.reconnecting, 0, 1) {
+		return // another reconnect goroutine is already running
+	}
+	defer atomic.StoreInt32(&a.reconnecting, 0)
+
 	for attempt := 1; ; attempt++ {
 		if atomic.LoadInt32(&a.isRunning) == 0 {
 			return
@@ -604,9 +659,14 @@ func (a *Agent) Stop() error {
 
 	a.listenerMgr.StopAll()
 
-	a.mu.RLock()
+	// Cancel any running traffic goroutines. (H1/H2)
+	a.mu.Lock()
+	if a.trafficCancel != nil {
+		a.trafficCancel()
+		a.trafficCancel = nil
+	}
 	client := a.client
-	a.mu.RUnlock()
+	a.mu.Unlock()
 
 	if client != nil {
 		return client.Close()
@@ -615,13 +675,15 @@ func (a *Agent) Stop() error {
 	return nil
 }
 
+// randomPayload returns n pseudo-random printable ASCII bytes.
+// Uses math/rand (same as pkg/traffic/generator.go) to avoid the signed-int64
+// modulo bug in the previous LCRNG implementation which could produce a negative
+// index and panic. (K2 / N1)
 func randomPayload(n int) []byte {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, n)
-	r := time.Now().UnixNano()
 	for i := range b {
-		r = r*6364136223846793005 + 1442695040888963407
-		b[i] = charset[((r>>33)^r)%int64(len(charset))]
+		b[i] = charset[rand.Intn(len(charset))]
 	}
 	return b
 }

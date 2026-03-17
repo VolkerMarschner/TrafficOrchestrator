@@ -14,7 +14,7 @@ import (
 	"trafficorch/pkg/registry"
 )
 
-const version = "0.4.10"
+const version = "0.4.11"
 
 func main() {
 	args := os.Args[1:]
@@ -381,7 +381,8 @@ func startAgent(cfg *config.AgentConfig) {
 	// ── Early privilege warning (v0.4.6) ──────────────────────────────────────
 	// Emit before attempting to connect so the warning is always in the status
 	// log, including in daemon mode where stderr is discarded.
-	if runtime.GOOS != "windows" && os.Getuid() != 0 {
+	nonRoot := runtime.GOOS != "windows" && os.Getuid() != 0
+	if nonRoot {
 		warnIfNonRoot(cfg.AgentID, nil, slog)
 	}
 
@@ -394,9 +395,18 @@ func startAgent(cfg *config.AgentConfig) {
 		return
 	}
 
-	// Forward privilege warning to master now that we have a connection.
-	if runtime.GOOS != "windows" && os.Getuid() != 0 {
-		warnIfNonRoot(agent.agentID, agent.client, slog)
+	// Forward the non-root warning to the master.
+	// M1: already logged above — only forward via SendWarning, do not log again.
+	if nonRoot {
+		msg := fmt.Sprintf(
+			"Agent %s running as non-root (uid=%d): listen rules on privileged ports "+
+				"(1-1023) will fail. Ensure assigned profiles only use ports > 1023, "+
+				"or restart with sudo / CAP_NET_BIND_SERVICE.",
+			agent.agentID, os.Getuid(),
+		)
+		if err := agent.client.SendWarning(agent.agentID, "NON_ROOT", msg); err != nil {
+			slog.Warn(fmt.Sprintf("Could not forward non-root warning to master: %v", err))
+		}
 	}
 
 	if err := agent.Start(); err != nil {

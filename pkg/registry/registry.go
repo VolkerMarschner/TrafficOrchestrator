@@ -60,6 +60,9 @@ func (r *Registry) Upsert(rec AgentRecord) {
 }
 
 // UpdateSeen refreshes LastSeen and optionally the version for an existing agent.
+// M4: Does NOT persist to disk — LastSeen is a high-frequency ephemeral metric
+// (called on every heartbeat, ~30 s per agent). The value is preserved in memory
+// and will be flushed on the next Upsert or SetOffline call.
 func (r *Registry) UpdateSeen(id, version string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -68,7 +71,7 @@ func (r *Registry) UpdateSeen(id, version string) {
 		if version != "" {
 			rec.Version = version
 		}
-		_ = r.save()
+		// intentionally no r.save() here
 	}
 }
 

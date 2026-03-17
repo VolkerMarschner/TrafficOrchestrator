@@ -61,11 +61,9 @@ func (l *Logger) openFile() error {
 	return l.openFileLocked()
 }
 
-// Rotate checks if rotation is needed and rotates the log file.
-func (l *Logger) Rotate() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
+// rotateLocked checks if rotation is needed and rotates the log file.
+// Caller must hold l.mu. (H3: extracted so Log() can call it without deadlock)
+func (l *Logger) rotateLocked() error {
 	if l.file == nil {
 		return l.openFileLocked()
 	}
@@ -75,45 +73,53 @@ func (l *Logger) Rotate() error {
 		return fmt.Errorf("failed to stat log file: %w", err)
 	}
 
-	if info.Size() >= l.maxSize {
-		if err := l.file.Close(); err != nil {
-			return fmt.Errorf("failed to close log file: %w", err)
-		}
-		l.file = nil
+	if info.Size() < l.maxSize {
+		return nil // no rotation needed yet
+	}
 
-		// Rotate existing files
-		for i := l.maxFiles - 1; i > 0; i-- {
-			oldPath := fmt.Sprintf("%s.%d", l.path, i)
-			newPath := fmt.Sprintf("%s.%d", l.path, i+1)
+	if err := l.file.Close(); err != nil {
+		return fmt.Errorf("failed to close log file: %w", err)
+	}
+	l.file = nil
 
-			if _, err := os.Stat(oldPath); err == nil {
-				if err := os.Rename(oldPath, newPath); err != nil {
-					return fmt.Errorf("failed to rename %s: %w", oldPath, err)
-				}
+	// Rotate existing files: .N → .(N+1)
+	for i := l.maxFiles - 1; i > 0; i-- {
+		oldPath := fmt.Sprintf("%s.%d", l.path, i)
+		newPath := fmt.Sprintf("%s.%d", l.path, i+1)
+		if _, err := os.Stat(oldPath); err == nil {
+			if err := os.Rename(oldPath, newPath); err != nil {
+				return fmt.Errorf("failed to rename %s: %w", oldPath, err)
 			}
-		}
-
-		// Move current file to .1
-		if err := os.Rename(l.path, fmt.Sprintf("%s.1", l.path)); err != nil {
-			return fmt.Errorf("failed to rename current log: %w", err)
-		}
-
-		// Open new log file — calls openFileLocked, not openFile, to avoid deadlock
-		if err := l.openFileLocked(); err != nil {
-			return fmt.Errorf("failed to open rotated log: %w", err)
 		}
 	}
 
-	return nil
+	// Move current file to .1
+	if err := os.Rename(l.path, fmt.Sprintf("%s.1", l.path)); err != nil {
+		return fmt.Errorf("failed to rename current log: %w", err)
+	}
+
+	// Open a fresh log file — must call locked variant to avoid deadlock.
+	return l.openFileLocked()
+}
+
+// Rotate is the public API that checks for rotation and rotates if needed.
+func (l *Logger) Rotate() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.rotateLocked()
 }
 
 // Log writes a formatted log message with timestamp.
+// It checks for log rotation before each write. (H3)
 func (l *Logger) Log(level, message string) {
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	logLine := fmt.Sprintf("[%s] %s: %s\n", timestamp, level, message)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// Rotate if the file has reached maxSize. Errors are best-effort.
+	_ = l.rotateLocked()
 
 	if l.file != nil {
 		if _, err := l.file.WriteString(logLine); err != nil {

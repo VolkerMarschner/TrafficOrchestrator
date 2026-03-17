@@ -376,9 +376,11 @@ func resolveDestination(dst, agentIP string, targetMap map[string]string, tagMap
 	}
 
 	// group:<tag>
+	// tagMap keys are stored lowercase (parser_v2.go: strings.ToLower).
+	// Use the lowercased form so "group:DC" correctly resolves tag "dc". (H5)
 	lower := strings.ToLower(dst)
 	if strings.HasPrefix(lower, "group:") {
-		tag := dst[len("group:"):]
+		tag := lower[len("group:"):]
 		return tagMap[tag]
 	}
 

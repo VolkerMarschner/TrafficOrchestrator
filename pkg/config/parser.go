@@ -184,6 +184,12 @@ func ParseAgentArgs(args []string) (*AgentConfig, error) {
 		}
 	}
 
+	// M5: honour TRAFFICORCH_PSK env var so the PSK does not have to appear in
+	// the process list (ps aux). CLI flag --psk takes precedence.
+	if cfg.PSK == "" {
+		cfg.PSK = os.Getenv("TRAFFICORCH_PSK")
+	}
+
 	// Validate required fields
 	if cfg.MasterHost == "" {
 		return nil, fmt.Errorf("--master is required")
@@ -192,7 +198,7 @@ func ParseAgentArgs(args []string) (*AgentConfig, error) {
 		return nil, fmt.Errorf("--port is required")
 	}
 	if cfg.PSK == "" {
-		return nil, fmt.Errorf("--psk is required")
+		return nil, fmt.Errorf("--psk is required (or set TRAFFICORCH_PSK env var)")
 	}
 	if cfg.AgentID == "" {
 		cfg.AgentID = "agent-unknown" // Default ID if not specified

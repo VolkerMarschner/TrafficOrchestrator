@@ -1,6 +1,7 @@
 package traffic
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -111,6 +112,7 @@ func (l *portListener) startTCP() error {
 		defer ln.Close()
 
 		// Close the net.Listener when stop is requested so Accept() unblocks.
+		// defer ln.Close() above ensures cleanup on any exit path. (N5)
 		go func() {
 			<-l.stopChan
 			ln.Close()
@@ -119,14 +121,12 @@ func (l *portListener) startTCP() error {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				select {
-				case <-l.stopChan:
+				if errors.Is(err, net.ErrClosed) {
 					log.Printf("traffic: TCP listener on port %d stopped", l.port)
-					return
-				default:
+				} else {
 					log.Printf("traffic: TCP listener on port %d accept error: %v", l.port, err)
-					return
 				}
+				return
 			}
 			go handleTCPConn(conn, l.port)
 		}
@@ -163,6 +163,8 @@ func (l *portListener) startUDP() error {
 	go func() {
 		defer pc.Close()
 
+		// Close the PacketConn when stop is requested so ReadFrom() unblocks.
+		// defer pc.Close() above ensures cleanup on any exit path. (N5)
 		go func() {
 			<-l.stopChan
 			pc.Close()
@@ -172,14 +174,12 @@ func (l *portListener) startUDP() error {
 		for {
 			n, src, err := pc.ReadFrom(buf)
 			if err != nil {
-				select {
-				case <-l.stopChan:
+				if errors.Is(err, net.ErrClosed) {
 					log.Printf("traffic: UDP listener on port %d stopped", l.port)
-					return
-				default:
+				} else {
 					log.Printf("traffic: UDP listener on port %d read error: %v", l.port, err)
-					return
 				}
+				return
 			}
 			log.Printf("traffic: UDP port %d received %d bytes from %s", l.port, n, src)
 		}

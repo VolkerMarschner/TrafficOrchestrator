@@ -46,6 +46,11 @@ type MasterServer struct {
 	// v0.4.7: multi-arch distribution
 	// Key: "linux/amd64", "linux/arm64", "windows/amd64", …
 	platformBinaries map[string]platformBinary
+
+	// v0.4.11: clean shutdown
+	done     chan struct{} // closed by Stop() to signal watchConfigFile to exit (H4)
+	stopOnce sync.Once    // guards close(done)
+	reloadMu sync.Mutex   // serialises loadConfigAndNotify() calls (M3)
 }
 
 // platformBinary holds the resolved path and pre-computed SHA-256 for a platform binary.
@@ -70,6 +75,7 @@ func NewMasterServer(cfg *config.MasterConfig, tlog, slog *logging.Logger) (*Mas
 		slog:        slog,
 		tlog:        tlog,
 		reg:         reg,
+		done:        make(chan struct{}),
 	}
 
 	ms.server, err = comm.NewMasterServer(
@@ -355,13 +361,19 @@ func (ms *MasterServer) loadConfig() error {
 // watchConfigFile monitors the config file and the profile directory for changes.
 // A reload is triggered whenever the config file or any .profile file is modified,
 // added, or removed (checked every configWatchInterval).
+//
+// H4: exits cleanly when ms.done is closed (during Stop()).
+// M2: uses time.NewTicker instead of repeated time.After() to avoid timer leaks.
 func (ms *MasterServer) watchConfigFile() {
+	ticker := time.NewTicker(configWatchInterval)
+	defer ticker.Stop()
+
 	var lastConfigMod time.Time
 	var lastProfileSig time.Time // latest mtime across all profile files
 
 	for {
 		select {
-		case <-time.After(configWatchInterval):
+		case <-ticker.C:
 			changed := false
 
 			// ── Check main config file ──────────────────────────────────────
@@ -396,6 +408,9 @@ func (ms *MasterServer) watchConfigFile() {
 		case <-ms.fileWatcher:
 			ms.slog.Info("Config reload triggered manually")
 			go ms.loadConfigAndNotify()
+
+		case <-ms.done:
+			return // server is shutting down
 		}
 	}
 }
@@ -422,7 +437,12 @@ func latestProfileMod(dir string) time.Time {
 }
 
 // loadConfigAndNotify reloads config and pushes updates to all agents.
+// reloadMu ensures that at most one reload runs at a time — concurrent triggers
+// (timer + manual) cannot interleave their loadConfig / notifyAllAgents calls. (M3)
 func (ms *MasterServer) loadConfigAndNotify() {
+	ms.reloadMu.Lock()
+	defer ms.reloadMu.Unlock()
+
 	if err := ms.loadConfig(); err != nil {
 		ms.slog.Error(fmt.Sprintf("Failed to reload config: %v", err))
 		return
@@ -516,6 +536,7 @@ func (ms *MasterServer) distributeRulesToAgent(agentID string) {
 					Source:   rule.Source,
 					Target:   rule.Target,
 					Port:     rule.Port,
+					Interval: rule.Interval, // H6: was missing, causing agents to ignore configured intervals
 					Count:    rule.Count,
 					Name:     rule.Name,
 					Role:     "connect",
@@ -573,7 +594,9 @@ func (ms *MasterServer) Start() error {
 // Stop gracefully shuts down the master server and the HTTP distribution server.
 func (ms *MasterServer) Stop(logger *logging.Logger) error {
 	logger.Info("Shutting down Master server...")
+	ms.stopOnce.Do(func() { close(ms.done) }) // signals watchConfigFile to exit (H4)
 	ms.server.CloseAllAgents()
+	ms.server.CloseListener() // lets acceptLoop() exit cleanly
 
 	if ms.httpSrv != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -591,8 +614,13 @@ func (ms *MasterServer) GetConfigPath() string {
 }
 
 // ReloadConfig manually triggers a config reload.
+// Non-blocking: if a reload is already pending (channel full), this is a no-op. (N2)
 func (ms *MasterServer) ReloadConfig() error {
-	ms.fileWatcher <- struct{}{}
+	select {
+	case ms.fileWatcher <- struct{}{}:
+	default:
+		// a reload is already queued
+	}
 	return nil
 }
 

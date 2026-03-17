@@ -127,6 +127,11 @@ func LoadAgentConf(path string) (*AgentConfig, error) {
 		return nil, fmt.Errorf("%s: read error: %w", path, err)
 	}
 
+	// M5: honour TRAFFICORCH_PSK env var as fallback (same as ParseAgentArgs).
+	if cfg.PSK == "" {
+		cfg.PSK = os.Getenv("TRAFFICORCH_PSK")
+	}
+
 	// Validate required fields
 	if cfg.MasterHost == "" {
 		return nil, fmt.Errorf("%s: MASTER is required", path)
@@ -135,7 +140,7 @@ func LoadAgentConf(path string) (*AgentConfig, error) {
 		return nil, fmt.Errorf("%s: PORT is required", path)
 	}
 	if cfg.PSK == "" {
-		return nil, fmt.Errorf("%s: PSK is required", path)
+		return nil, fmt.Errorf("%s: PSK is required (or set TRAFFICORCH_PSK env var)", path)
 	}
 	if cfg.AgentID == "" {
 		cfg.AgentID = "agent-unknown"
