@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -171,6 +172,11 @@ func (s *MasterServer) acceptLoop() {
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
+			// net.ErrClosed is returned when the listener has been closed deliberately
+			// (e.g. during server shutdown). Exit cleanly instead of spinning.
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			log.Printf("comm: listener error: %v", err)
 			continue
 		}
@@ -459,6 +465,12 @@ func (s *MasterServer) CloseAllAgents() {
 		ac.channel.Close()
 	}
 	s.agents = make(map[string]*agentConn)
+}
+
+// CloseListener closes the TCP listener so that acceptLoop() exits cleanly.
+// Call this during server shutdown after CloseAllAgents().
+func (s *MasterServer) CloseListener() {
+	s.listener.Close() //nolint:errcheck
 }
 
 // SendToAllAgents broadcasts msg to every connected agent.

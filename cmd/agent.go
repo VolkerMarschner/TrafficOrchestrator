@@ -49,6 +49,9 @@ type Agent struct {
 	// A fresh channel is created for each new connection (reconnect).
 	connStop chan struct{}
 
+	// stopOnce guards the single close(stopChan) in Stop() to prevent double-close panics.
+	stopOnce sync.Once
+
 	// v0.4.6: split logging
 	slog *logging.Logger // agent-status.log  — start/stop, connect, update events
 	tlog *logging.Logger // agent-traffic.log — rule application, connections, listeners
@@ -233,19 +236,32 @@ func commRulesToConfig(rules []*comm.TrafficRule) []*config.TrafficRule {
 // connStop is a per-connection channel that is closed when this connection is
 // declared dead so that the paired sendHeartbeatLoop exits cleanly.
 func (a *Agent) receiveMessages(connStop chan struct{}) {
+	// Capture the client pointer once under lock so we have a stable reference
+	// for the lifetime of this connection. reconnectToMaster() writes a.client
+	// under the mutex; reading it without lock would be a data race.
+	a.mu.RLock()
+	client := a.client
+	a.mu.RUnlock()
+
 	for {
 		if atomic.LoadInt32(&a.isRunning) == 0 {
 			return
 		}
 
-		msg, msgBytes, err := a.client.ReadMessage()
+		msg, msgBytes, err := client.ReadMessage()
 		if err != nil {
+			// If we're shutting down, the client was closed deliberately by Stop().
+			// Don't start a reconnect — just signal the heartbeat loop and exit.
+			if atomic.LoadInt32(&a.isRunning) == 0 {
+				close(connStop)
+				return
+			}
 			a.slog.Error(fmt.Sprintf("Connection to master lost: %v — reconnecting...", err))
 			// Close connStop to signal the paired sendHeartbeatLoop to exit,
 			// then kick off a reconnect goroutine and leave this goroutine.
 			// reconnectToMaster() will start fresh receiveMessages + sendHeartbeatLoop.
 			close(connStop)
-			a.client.Close()
+			client.Close()
 			go a.reconnectToMaster()
 			return
 		}
@@ -253,7 +269,9 @@ func (a *Agent) receiveMessages(connStop chan struct{}) {
 		switch msg.Type {
 		case comm.MsgConfigUpdate:
 			var configMsg comm.ConfigUpdateMessage
-			if err := json.Unmarshal(msgBytes, &configMsg); err == nil {
+			if err := json.Unmarshal(msgBytes, &configMsg); err != nil {
+				a.slog.Error(fmt.Sprintf("Failed to parse CONFIG_UPDATE: %v", err))
+			} else {
 				a.tlog.Info(fmt.Sprintf("CONFIG_UPDATE received: %d rule(s) (TTL=%ds)", len(configMsg.Rules), configMsg.TTL))
 				cfgRules := commRulesToConfig(configMsg.Rules)
 				a.applyRules(cfgRules)
@@ -262,7 +280,9 @@ func (a *Agent) receiveMessages(connStop chan struct{}) {
 
 		case comm.MsgTrafficStart:
 			var startMsg comm.TrafficStartMessage
-			if err := json.Unmarshal(msgBytes, &startMsg); err == nil {
+			if err := json.Unmarshal(msgBytes, &startMsg); err != nil {
+				a.slog.Error(fmt.Sprintf("Failed to parse TRAFFIC_START: %v", err))
+			} else {
 				a.startTraffic(startMsg.Rules)
 			}
 
@@ -271,7 +291,9 @@ func (a *Agent) receiveMessages(connStop chan struct{}) {
 
 		case comm.MsgUpdateAvailable:
 			var updateMsg comm.UpdateAvailableMessage
-			if err := json.Unmarshal(msgBytes, &updateMsg); err == nil {
+			if err := json.Unmarshal(msgBytes, &updateMsg); err != nil {
+				a.slog.Error(fmt.Sprintf("Failed to parse UPDATE_AVAILABLE: %v", err))
+			} else {
 				a.slog.Info(fmt.Sprintf("Update available: v%s (current: v%s) — downloading...", updateMsg.NewVersion, version))
 				go a.applyUpdate(updateMsg)
 			}
@@ -435,6 +457,11 @@ func (a *Agent) stopTraffic() {
 // connStop is closed by receiveMessages() when the connection dies, causing
 // this loop to exit so it doesn't keep sending on a dead socket.
 func (a *Agent) sendHeartbeatLoop(connStop <-chan struct{}) {
+	// Capture client once under lock — same reasoning as receiveMessages().
+	a.mu.RLock()
+	client := a.client
+	a.mu.RUnlock()
+
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
@@ -451,7 +478,7 @@ func (a *Agent) sendHeartbeatLoop(connStop <-chan struct{}) {
 			activeRules := len(a.currentRules)
 			a.mu.RUnlock()
 
-			if err := a.client.SendHeartbeat(version, cpuUsage, memUsage, activeRules); err != nil {
+			if err := client.SendHeartbeat(version, cpuUsage, memUsage, activeRules); err != nil {
 				a.slog.Warn(fmt.Sprintf("Failed to send heartbeat: %v", err))
 			}
 
@@ -571,10 +598,18 @@ func (a *Agent) Stop() error {
 	a.slog.Info("Shutting down agent...")
 	atomic.StoreInt32(&a.isRunning, 0)
 
+	// Close stopChan exactly once so goroutines waiting on <-a.stopChan
+	// (sendHeartbeatLoop, reconnectToMaster retry) exit immediately.
+	a.stopOnce.Do(func() { close(a.stopChan) })
+
 	a.listenerMgr.StopAll()
 
-	if a.client != nil {
-		return a.client.Close()
+	a.mu.RLock()
+	client := a.client
+	a.mu.RUnlock()
+
+	if client != nil {
+		return client.Close()
 	}
 
 	return nil
