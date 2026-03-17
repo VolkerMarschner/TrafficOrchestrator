@@ -44,6 +44,11 @@ type Agent struct {
 	stopChan     chan struct{}
 	listenerMgr  *traffic.ListenerManager
 
+	// connStop is closed when the current TCP connection to the master dies.
+	// receiveMessages() closes it on first error; sendHeartbeatLoop() exits on it.
+	// A fresh channel is created for each new connection (reconnect).
+	connStop chan struct{}
+
 	// v0.4.6: split logging
 	slog *logging.Logger // agent-status.log  — start/stop, connect, update events
 	tlog *logging.Logger // agent-traffic.log — rule application, connections, listeners
@@ -74,6 +79,7 @@ func NewAgent(cfg *config.AgentConfig, tlog, slog *logging.Logger) (*Agent, erro
 		standalone:  false,
 		masterCfg:   masterConnInfo{cfg.MasterHost, cfg.Port, cfg.PSK},
 		stopChan:    make(chan struct{}),
+		connStop:    make(chan struct{}),
 		listenerMgr: traffic.NewListenerManager(),
 		slog:        slog,
 		tlog:        tlog,
@@ -125,6 +131,7 @@ func newStandaloneAgent(instrPath string, fallbackCfg masterConnInfo, agentID st
 		masterCfg:    mCfg,
 		currentRules: instrConf.Rules,
 		stopChan:     make(chan struct{}),
+		connStop:     make(chan struct{}),
 		listenerMgr:  traffic.NewListenerManager(),
 		slog:         slog,
 		tlog:         tlog,
@@ -144,8 +151,8 @@ func (a *Agent) Start() error {
 	atomic.StoreInt32(&a.isRunning, 1)
 
 	if !a.standalone {
-		go a.receiveMessages()
-		go a.sendHeartbeatLoop()
+		go a.receiveMessages(a.connStop)
+		go a.sendHeartbeatLoop(a.connStop)
 	} else {
 		a.applyRules(a.currentRules)
 	}
@@ -223,7 +230,9 @@ func commRulesToConfig(rules []*comm.TrafficRule) []*config.TrafficRule {
 }
 
 // receiveMessages continuously reads and handles messages from the master.
-func (a *Agent) receiveMessages() {
+// connStop is a per-connection channel that is closed when this connection is
+// declared dead so that the paired sendHeartbeatLoop exits cleanly.
+func (a *Agent) receiveMessages(connStop chan struct{}) {
 	for {
 		if atomic.LoadInt32(&a.isRunning) == 0 {
 			return
@@ -231,9 +240,14 @@ func (a *Agent) receiveMessages() {
 
 		msg, msgBytes, err := a.client.ReadMessage()
 		if err != nil {
-			a.slog.Error(fmt.Sprintf("Error receiving message from master: %v", err))
-			time.Sleep(reconnectDelay)
-			continue
+			a.slog.Error(fmt.Sprintf("Connection to master lost: %v — reconnecting...", err))
+			// Close connStop to signal the paired sendHeartbeatLoop to exit,
+			// then kick off a reconnect goroutine and leave this goroutine.
+			// reconnectToMaster() will start fresh receiveMessages + sendHeartbeatLoop.
+			close(connStop)
+			a.client.Close()
+			go a.reconnectToMaster()
+			return
 		}
 
 		switch msg.Type {
@@ -417,7 +431,10 @@ func (a *Agent) stopTraffic() {
 	a.tlog.Info("Stopping traffic generation...")
 }
 
-func (a *Agent) sendHeartbeatLoop() {
+// sendHeartbeatLoop sends periodic heartbeats to the master.
+// connStop is closed by receiveMessages() when the connection dies, causing
+// this loop to exit so it doesn't keep sending on a dead socket.
+func (a *Agent) sendHeartbeatLoop(connStop <-chan struct{}) {
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
@@ -437,6 +454,10 @@ func (a *Agent) sendHeartbeatLoop() {
 			if err := a.client.SendHeartbeat(version, cpuUsage, memUsage, activeRules); err != nil {
 				a.slog.Warn(fmt.Sprintf("Failed to send heartbeat: %v", err))
 			}
+
+		case <-connStop:
+			// Connection died — receiveMessages() will handle the reconnect.
+			return
 
 		case <-a.stopChan:
 			return
@@ -474,9 +495,9 @@ func (a *Agent) reconnectToMaster() {
 
 		client, err := comm.NewAgentClient(a.masterCfg.host, a.masterCfg.port, a.masterCfg.psk)
 		if err != nil {
-			a.slog.Warn(fmt.Sprintf("Reconnect attempt %d failed: %v — retrying in 30s", attempt, err))
+			a.slog.Warn(fmt.Sprintf("Reconnect attempt %d failed: %v — retrying in %s", attempt, err, masterReconnectDelay))
 			select {
-			case <-time.After(30 * time.Second):
+			case <-time.After(masterReconnectDelay):
 				continue
 			case <-a.stopChan:
 				return
@@ -488,24 +509,29 @@ func (a *Agent) reconnectToMaster() {
 
 		if err := client.Register(a.agentID, hostname, platform, version); err != nil {
 			client.Close()
-			a.slog.Warn(fmt.Sprintf("Reconnect registration failed: %v — retrying in 30s", err))
+			a.slog.Warn(fmt.Sprintf("Reconnect registration failed: %v — retrying in %s", err, masterReconnectDelay))
 			select {
-			case <-time.After(30 * time.Second):
+			case <-time.After(masterReconnectDelay):
 				continue
 			case <-a.stopChan:
 				return
 			}
 		}
 
-		a.slog.Info("Reconnected to master — switching to connected mode")
+		a.slog.Info(fmt.Sprintf("Reconnected to master after %d attempt(s) — switching to connected mode", attempt))
+
+		// Create a fresh connStop for this new connection so the new goroutines
+		// can be signalled independently from any previous (now-dead) connection.
+		newConnStop := make(chan struct{})
 
 		a.mu.Lock()
 		a.client = client
+		a.connStop = newConnStop
 		a.standalone = false
 		a.mu.Unlock()
 
-		go a.receiveMessages()
-		go a.sendHeartbeatLoop()
+		go a.receiveMessages(newConnStop)
+		go a.sendHeartbeatLoop(newConnStop)
 		return
 	}
 }

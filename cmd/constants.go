@@ -21,7 +21,8 @@ const (
 	defaultConnectionDelay = 100 * time.Millisecond
 	heartbeatInterval      = 30 * time.Second
 	heartbeatCheck         = 1 * time.Minute
-	reconnectDelay         = 5 * time.Second
+	reconnectDelay         = 5 * time.Second  // delay between reconnect attempts (v0.4.7: also used by receiveMessages error path)
+	masterReconnectDelay   = 30 * time.Second // longer pause between reconnect attempts when master is confirmed down
 	configWatchInterval    = 5 * time.Second
 )
 
