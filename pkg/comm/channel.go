@@ -542,7 +542,21 @@ func NewAgentClient(master string, port int, psk string) (*AgentClient, error) {
 
 // Register sends a REGISTER message to the master and waits for acknowledgement.
 // agentVersion is the binary version string (e.g. "0.4.5").
+//
+// AgentIP is set to the local address of the outbound TCP connection so the
+// master can match the agent against SOURCE/TARGET IPs in traffic rules even
+// when the TCP source address seen by the master differs from the agent's
+// configured interface IP (e.g. multi-homed hosts, NAT scenarios). Falls back
+// to the TCP remote-address heuristic on the master side if not set.
 func (c *AgentClient) Register(agentID string, hostname string, platform string, agentVersion string) error {
+	// Self-report the local IP of this connection so the master uses the correct
+	// interface address for rule matching rather than relying solely on the TCP
+	// source address (which may differ for multi-homed or NATted agents).
+	localIP := ""
+	if localAddr, _, err := net.SplitHostPort(c.conn.LocalAddr().String()); err == nil {
+		localIP = localAddr
+	}
+
 	msg := &RegisterMessage{
 		BaseMessage: BaseMessage{
 			Type:      MsgRegister,
@@ -553,6 +567,7 @@ func (c *AgentClient) Register(agentID string, hostname string, platform string,
 		Hostname:     hostname,
 		Platform:     platform,
 		AgentVersion: agentVersion,
+		AgentIP:      localIP,
 	}
 
 	if err := c.channel.WriteMessage(msg); err != nil {

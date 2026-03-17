@@ -490,6 +490,9 @@ func (ms *MasterServer) distributeRulesToAgent(agentID string) {
 	var agentRules []*comm.TrafficRule
 
 	// ── Profile-based distribution (v0.4.0) ──────────────────────────────────
+	if len(profiles) > 0 && len(assignments) > 0 && agentIP == "" {
+		ms.tlog.Warn(fmt.Sprintf("Agent %s: profile distribution skipped — agent IP unknown (check that the agent's interface IP is routable to the master)", agentID))
+	}
 	if len(profiles) > 0 && len(assignments) > 0 && agentIP != "" {
 		profileNames := config.LookupAssignments(agentIP, assignments, targetMap)
 		if len(profileNames) > 0 {
@@ -553,7 +556,11 @@ func (ms *MasterServer) distributeRulesToAgent(agentID string) {
 	}
 
 	if len(agentRules) == 0 {
-		ms.tlog.Debug(fmt.Sprintf("No rules applicable to agent %s (IP=%s)", agentID, agentIP))
+		msg := fmt.Sprintf("No rules applicable to agent %s (IP=%s) — "+
+			"verify SOURCE/TARGET IPs in config match the agent IP, "+
+			"or check [ASSIGNMENTS] entries if using profiles", agentID, agentIP)
+		ms.tlog.Warn(msg)
+		ms.slog.Warn(msg)
 		return
 	}
 
